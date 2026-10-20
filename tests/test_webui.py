@@ -72,6 +72,33 @@ class WebUITests(unittest.IsolatedAsyncioTestCase):
         self.plugin.engine.store.record_browse_decision("1", 1, False, "休息", 601)
         self.assertEqual((await self.plugin.autopilot_overview())["next_check"], "已暂停，恢复后重新检查")
 
+    async def test_overdue_check_is_reported_as_waiting_in_page_and_status(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        self.plugin.engine.clock = lambda: datetime(2026, 10, 20, 12, tzinfo=ZoneInfo('Asia/Shanghai')).timestamp()
+        await self.plugin.engine.start()
+        now = self.plugin.engine.clock()
+        self.plugin.engine.store.record_browse_decision('1', now - 1800, True, '去浏览', now - 600)
+        self.assertEqual((await self.plugin.autopilot_overview())['next_check'], '已到检查时间，等待调度')
+        self.assertIn('下次意愿检查：已到检查时间，等待调度', await self.plugin.engine.status())
+        async with self.plugin.engine.lock:
+            self.assertEqual((await self.plugin.autopilot_overview())['next_check'], '已到检查时间，等待当前任务完成')
+        self.client.recommended.assert_not_awaited()
+        self.plugin.engine.generate.assert_not_awaited()
+
+    async def test_inactive_or_fixed_mode_does_not_display_old_autonomous_time(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        await self.plugin.engine.start()
+        self.plugin.engine.store.record_browse_decision('1', 1, True, '去浏览', 601)
+        self.plugin.engine.clock = lambda: datetime(2026, 10, 20, 2, tzinfo=ZoneInfo('Asia/Shanghai')).timestamp()
+        self.assertEqual((await self.plugin.autopilot_overview())['next_check'], '当前不在活动时段，进入活动时段后检查')
+        self.plugin.engine.clock = lambda: datetime(2026, 10, 20, 12, tzinfo=ZoneInfo('Asia/Shanghai')).timestamp()
+        config = self.plugin.config.model_dump()
+        config['browse']['autonomous_enabled'] = False
+        self.plugin.set_plugin_config(config)
+        self.assertEqual((await self.plugin.autopilot_overview())['next_check'], '按固定间隔浏览')
+
     async def test_web_preview_finishes_in_background_without_posting_or_chat_messages(self):
         result = await self.plugin.autopilot_command("/bili_auto preview")
         self.assertTrue(result["ok"])

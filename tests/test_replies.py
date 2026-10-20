@@ -5,7 +5,6 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
-import asyncio
 import json
 import unittest
 
@@ -62,8 +61,58 @@ class ReplyEngineTests(unittest.IsolatedAsyncioTestCase):
         self.store.decide_reply('1', MESSAGE.source_rpid, 'publish', self.now,
                                 'model_error', '', '模型调用失败：TimeoutError')
         self.store.initialize()
+        self.now += 601
         self.assertIn('已提交跟进回复', await self.engine.reply_round())
         self.client.publish_reply.assert_awaited_once()
+
+    async def test_reply_failures_are_bounded_and_charge_each_analysis(self):
+        self.generate.side_effect=ModelTimeoutError('候选模型均超时')
+        await self.engine.reply_round()
+        self.now+=600
+        await self.engine.reply_round()
+        self.now+=600
+        await self.engine.reply_round()
+        self.assertEqual(self.generate.await_count,2)
+        self.now+=600
+        await self.engine.reply_round()
+        await self.engine.initialize()
+        self.now+=600
+        await self.engine.reply_round()
+        self.assertEqual(self.generate.await_count,3)
+        self.assertEqual(self.store.stats('1',0)['reply_analyses'],3)
+        self.assertFalse(self.engine.paused)
+        self.client.publish_reply.assert_not_awaited()
+
+    async def test_interrupted_reply_analysis_recovers_without_losing_quota(self):
+        self.store.receive_replies('1',[MESSAGE])
+        self.store.decide_reply('1',MESSAGE.source_rpid,'publish',self.now,'reading')
+        await self.engine.initialize()
+        self.assertEqual(self.store.stats('1',0)['reply_analyses'],1)
+        self.assertEqual(self.store.pending_replies('1','publish',0,self.now+599),[])
+        self.now += 600
+        self.assertIn('已提交跟进回复',await self.engine.reply_round())
+        self.client.publish_reply.assert_awaited_once()
+        self.assertEqual(self.store.stats('1',0)['reply_analyses'],2)
+
+    async def test_repeated_interrupted_reply_analyses_reach_retry_limit(self):
+        self.store.receive_replies('1',[MESSAGE])
+        for failures in range(1,4):
+            self.store.decide_reply('1',MESSAGE.source_rpid,'publish',self.now,'reading')
+            await self.engine.initialize()
+            await self.engine.initialize()
+            self.assertEqual(self.store.stats('1',0)['reply_analyses'],failures)
+            self.now += 600*failures
+            pending = self.store.pending_replies('1','publish',0,self.now)
+            self.assertEqual(pending,[MESSAGE] if failures<3 else [])
+        self.client.publish_reply.assert_not_awaited()
+
+    async def test_reply_reading_with_pending_send_is_never_recovered(self):
+        self.store.receive_replies('1',[MESSAGE])
+        self.store.decide_reply('1',MESSAGE.source_rpid,'publish',self.now,'reading')
+        self.assertEqual(self.store.reserve_reply('1',MESSAGE,'模拟跟进内容',self.now,0,3,600,3,.88),'reserved')
+        await self.engine.initialize()
+        self.assertEqual(self.store.stats('1',0)['unresolved'],[MESSAGE.bvid])
+        self.assertEqual(self.store.pending_replies('1','publish',0,self.now+10000),[])
 
     async def test_live_reply_targets_incoming_message_and_is_not_repeated(self):
         self.assertIn('已提交跟进回复',await self.engine.reply_round())

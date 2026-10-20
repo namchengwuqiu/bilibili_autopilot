@@ -76,6 +76,25 @@ class VideoItem:
 class Evidence:
     source: str
     text: str
+    read_warning: str = ""
+
+
+class DecisionValidationError(ValueError):
+    """可公开的校验类别及说明；不保留模型原文。"""
+
+    def __init__(self, code: str, reason: str):
+        self.code = code
+        super().__init__(reason)
+
+
+def decision_object(raw: str) -> Any:
+    text = raw.strip()
+    if text.startswith("```") and text.endswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)[:-3].strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise DecisionValidationError("json_format", f"JSON 格式无效（第 {exc.lineno} 行、第 {exc.colno} 列）") from None
 
 
 @dataclass(frozen=True)
@@ -110,19 +129,16 @@ class ReplyDecision:
 
 
 def parse_reply_decision(raw: str, max_chars: int) -> ReplyDecision:
-    text = raw.strip()
-    if text.startswith("```") and text.endswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)[:-3].strip()
-    obj = json.loads(text)
+    obj = decision_object(raw)
     if not isinstance(obj, dict) or set(obj) != {"should_reply", "reply", "reason"}:
-        raise ValueError("跟进回复的判断字段无效")
+        raise DecisionValidationError("fields", "跟进回复的判断字段无效")
     if type(obj["should_reply"]) is not bool or not isinstance(obj["reply"], str) or not isinstance(obj["reason"], str):
-        raise ValueError("跟进回复的判断类型无效")
+        raise DecisionValidationError("types", "跟进回复的判断类型无效")
     reply, reason = obj["reply"].strip(), obj["reason"].strip()
     if not 1 <= len(reason) <= 300 or len(reply) > max_chars or any(unicodedata.category(c) == "Cc" for c in reply + reason):
-        raise ValueError("跟进回复的理由或控制字符无效")
+        raise DecisionValidationError("reply_content", "跟进回复的理由长度或控制字符无效")
     if obj["should_reply"] and (not 2 <= len(reply) <= max_chars or not normalized(reply)):
-        raise ValueError("跟进回复的正文长度或内容无效")
+        raise DecisionValidationError("reply_content", "跟进回复的正文长度或内容无效")
     return ReplyDecision(obj["should_reply"], reply, reason)
 
 
@@ -249,29 +265,26 @@ def browse_prompt(*, persona: str, interests: str, now: float, timezone: str,
 
 
 def parse_decision(raw: str, evidence: Evidence, max_chars: int) -> Decision:
-    text = raw.strip()
-    if text.startswith("```") and text.endswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)[:-3].strip()
-    obj = json.loads(text)
+    obj = decision_object(raw)
     required = {"should_comment", "interest", "comment", "reason", "evidence_quote"}
     if not isinstance(obj, dict) or set(obj) != required:
-        raise ValueError("模型输出字段不完整或包含额外字段")
+        raise DecisionValidationError("fields", "模型输出字段不完整或包含额外字段")
     if type(obj["should_comment"]) is not bool or type(obj["interest"]) not in (int, float):
-        raise ValueError("模型输出类型无效")
+        raise DecisionValidationError("types", "模型输出类型无效")
     if not math.isfinite(obj["interest"]) or not 0 <= obj["interest"] <= 1:
-        raise ValueError("兴趣分必须在 0 到 1 之间")
+        raise DecisionValidationError("interest", "兴趣分必须在 0 到 1 之间")
     for field in ("comment", "reason", "evidence_quote"):
         if not isinstance(obj[field], str):
-            raise ValueError("评论、理由和内容依据必须是字符串")
+            raise DecisionValidationError("types", "评论、理由和内容依据必须是字符串")
     comment = obj["comment"].strip()
     if obj["should_comment"]:
         quote = normalized(obj["evidence_quote"])
         if len(quote) < 6 or quote not in normalized(evidence.text):
-            raise ValueError("评论没有可核验的视频内容依据")
+            raise DecisionValidationError("evidence", "内容引用不足六个有效字符或未出现在摘要、字幕中")
         if not 2 <= len(comment) <= max_chars or any(unicodedata.category(c) == "Cc" for c in comment):
-            raise ValueError("评论长度或控制字符不符合限制")
+            raise DecisionValidationError("comment_content", "评论长度或控制字符不符合限制")
         if not normalized(comment):
-            raise ValueError("评论没有有效文字")
+            raise DecisionValidationError("comment_content", "评论没有有效文字")
     return Decision(obj["should_comment"], float(obj["interest"]), comment,
                     obj["reason"][:500], obj["evidence_quote"][:500])
 

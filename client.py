@@ -3,7 +3,7 @@
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import asyncio
@@ -13,7 +13,7 @@ import tempfile
 import time
 
 from bilibili_api import Credential, comment, homepage, session, user, video
-from bilibili_api.exceptions import ResponseCodeException
+from bilibili_api.exceptions import NetworkException, ResponseCodeException
 from bilibili_api.utils.network import Api
 
 import httpx
@@ -22,14 +22,32 @@ import qrcode
 from .models import Evidence, IncomingReply, VideoItem, recommendations
 
 
+READ_NETWORK_ERRORS = (asyncio.TimeoutError, httpx.TimeoutException, httpx.NetworkError)
+try:
+    from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError, Timeout as CurlTimeout
+except ImportError:
+    pass  # curl_cffi 是 B 站库的可选客户端，未安装时仍支持 httpx。
+else:
+    READ_NETWORK_ERRORS += (CurlConnectionError, CurlTimeout)
+
+
 class LoginRequired(Exception):
     pass
 
 
 class PlatformError(Exception):
     def __init__(self, operation: str, code: int):
+        self.operation = operation
         self.code = code
         super().__init__(f"{operation}被平台拒绝（code={code}）")
+
+
+class VideoReadError(Exception):
+    """视频读取阶段的可公开错误，不包含签名地址或请求头。"""
+
+    def __init__(self, reason: str, retryable: bool):
+        self.retryable = retryable
+        super().__init__(reason)
 
 
 class UnknownPublish(Exception):
@@ -229,32 +247,67 @@ class BiliClient:
             cursor_id, cursor_time = next_cursor
         return sorted(result, key=lambda message: (message.received_at, message.source_rpid))
 
+    async def _read_stage(self, stage: str, operation: Awaitable[Any]) -> Any:
+        try:
+            return await asyncio.wait_for(operation, timeout=30)
+        except ResponseCodeException as exc:
+            raise PlatformError(stage, exc.code) from None
+        except READ_NETWORK_ERRORS as exc:
+            raise VideoReadError(f"{stage}超时或网络连接失败：{type(exc).__name__}", True) from None
+        except (NetworkException, httpx.HTTPStatusError) as exc:
+            code = exc.status if isinstance(exc, NetworkException) else exc.response.status_code
+            if code in {401,403,412,429}:
+                raise PlatformError(f"{stage}（HTTP）",code) from None
+            raise VideoReadError(f"{stage}失败（HTTP {code}）", code >= 500 or code == 408) from None
+
     async def understand(self, item: VideoItem, max_chars: int) -> Tuple[VideoItem, Evidence]:
         resource = video.Video(bvid=item.bvid, credential=self.credential)
+        info = await self._read_stage("读取视频信息", resource.get_info())
+        if int(info["aid"]) != item.aid or info["bvid"] != item.bvid:
+            raise ValueError("视频 ID 校验失败")
+        item = replace(item, title=str(info.get("title", ""))[:300],
+                       description=str(info.get("desc", ""))[:3000],
+                       duration=int(info.get("duration", 0)),
+                       up_uid=str(info["owner"]["mid"]), up_name=str(info["owner"].get("name", ""))[:100])
+        if int(info.get("videos", 1)) > 1:
+            return item, Evidence("unavailable", "")
+        cid = int(info["cid"])
+        summary_error = None
         try:
-            info = await asyncio.wait_for(resource.get_info(), timeout=30)
-            if int(info["aid"]) != item.aid or info["bvid"] != item.bvid:
-                raise ValueError("视频 ID 校验失败")
-            item = replace(item, title=str(info.get("title", ""))[:300],
-                           description=str(info.get("desc", ""))[:3000],
-                           duration=int(info.get("duration", 0)),
-                           up_uid=str(info["owner"]["mid"]), up_name=str(info["owner"].get("name", ""))[:100])
-            if int(info.get("videos", 1)) > 1:
-                return item, Evidence("unavailable", "")
-            cid = int(info["cid"])
-            summary = await asyncio.wait_for(resource.get_ai_conclusion(cid=cid), timeout=30)
+            summary = await self._read_stage("读取 AI 摘要", resource.get_ai_conclusion(cid=cid))
+        except (PlatformError, VideoReadError) as exc:
+            # 摘要与字幕是独立内容来源；仅在摘要临时不可用时继续读取字幕。
+            if not (exc.code == -504 if isinstance(exc, PlatformError) else exc.retryable):
+                raise
+            summary_error = exc
+        else:
             model_result = summary.get("model_result") or {}
             text = model_result.get("summary", "")
             if isinstance(text, str) and len(text.strip()) >= 30:
                 return item, Evidence("B站 AI 摘要（可能存在概括误差）", text.strip()[:max_chars])
-            subtitles = await asyncio.wait_for(resource.get_subtitle(cid=cid), timeout=30)
-        except ResponseCodeException as exc:
-            raise PlatformError("读取视频内容", exc.code) from None
+        try:
+            subtitles = await self._read_stage("读取字幕列表", resource.get_subtitle(cid=cid))
+        except (PlatformError, VideoReadError) as exc:
+            if summary_error is None:
+                raise
+            retryable = exc.code == -504 if isinstance(exc, PlatformError) else exc.retryable
+            if not retryable:
+                raise
+            raise VideoReadError(f"{summary_error}；{exc}", True) from None
         entries = (subtitles or {}).get("subtitles") or []
         entries = sorted(entries, key=lambda x: not str(x.get("lan", "")).startswith(("zh", "ai-zh")))
         if not entries:
+            if summary_error is not None:
+                raise VideoReadError(f"{summary_error}；视频没有可用字幕", True) from None
             return item, Evidence("unavailable", "")
         url = subtitle_url(entries[0]["subtitle_url"])
+        text = await self._read_stage("下载字幕文件", self._subtitle_text(url))
+        if summary_error is not None and len(text.strip()) < 30:
+            raise VideoReadError(f"{summary_error}；字幕不足三十字，无法提供有效内容依据", True) from None
+        return item, Evidence("字幕（超长字幕只读取前段）", text.strip()[:max_chars],
+                              str(summary_error) if summary_error is not None else "")
+
+    async def _subtitle_text(self, url: str) -> str:
         chunks = bytearray()
         # 字幕单独使用不含账号 Cookie 的会话；限制响应大小，不跟随重定向。
         async with self.public_http.stream("GET", url) as response:
@@ -265,7 +318,7 @@ class BiliClient:
                     raise ValueError("字幕文件超过 2 MiB")
         payload = json.loads(chunks)
         text = "\n".join(str(row.get("content", "")) for row in payload.get("body", []) if isinstance(row, dict))
-        return item, Evidence("字幕（超长字幕只读取前段）", text.strip()[:max_chars])
+        return text
 
     async def publish_reply(self, message: IncomingReply, text: str, can_send: Callable[[], bool]) -> str:
         item = VideoItem(message.bvid, message.aid, "", "", "", 0)

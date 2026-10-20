@@ -254,14 +254,14 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", self.engine.last_result)
         self.client.publish.assert_not_awaited()
 
-    async def test_model_response_error_pauses_with_actionable_reason_and_no_attempt(self):
+    async def test_model_response_error_keeps_running_with_actionable_reason_and_no_attempt(self):
         message = "模型只返回了思考内容，没有评论正文；请检查模型任务的最大输出 token 上限后重新预览"
         self.generate.side_effect = ModelResponseError(message)
         await self.engine.start()
         result = await self.engine.round()
-        self.assertTrue(self.engine.paused)
-        self.assertEqual(result, "已暂停：" + message)
-        self.assertEqual(self.store.control()["pause_reason"], message)
+        self.assertFalse(self.engine.paused)
+        self.assertIn(message, result)
+        self.assertEqual(self.store.control()["paused"], "0")
         self.assertIn(message, self.store.history(self.client.uid))
         self.assertEqual(self.store.stats(self.client.uid, 0)["attempts"], 0)
         self.client.publish.assert_not_awaited()
@@ -382,23 +382,82 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.generate.assert_awaited_once()
         self.client.publish.assert_not_awaited()
 
-    async def test_cooldown_is_checked_before_browse_models_and_recovers_at_boundary(self):
+    async def test_cooldown_allows_autonomous_browsing_and_recovers_at_boundary(self):
         await self.engine.start()
         self.store.reserve(self.client.uid, 'BV0987654321', '不重复的已有评论', self.now, 0, 12, 0, .88)
         self.store.finish(self.client.uid, 'BV0987654321', 'sent', '1')
         self.cfg.browse.autonomous_enabled = True
+        self.cfg.browse.interval_seconds = 600
+        self.cfg.browse.max_check_minutes = 20
+        browse = json.dumps({'should_browse': True, 'reason': '想看新视频', 'next_check_minutes': 10})
+        self.generate.side_effect = [browse, decision(), browse, decision()]
         result = await self.engine.round()
         self.assertIn('12:45:00', result)
         self.assertIn('冷却中', result)
-        self.client.recommended.assert_not_awaited()
-        self.client.understand.assert_not_awaited()
-        self.generate.assert_not_awaited()
+        self.client.recommended.assert_awaited_once()
+        self.client.understand.assert_awaited_once()
+        self.assertEqual(self.generate.await_count, 2)
+        self.client.publish.assert_not_awaited()
         self.assertFalse(self.engine.paused)
         self.assertFalse(self.store.seen(self.client.uid, ITEM.bvid, 'publish'))
-        self.cfg.browse.autonomous_enabled = False
+        self.assertTrue(self.store.seen(self.client.uid, ITEM.bvid, 'publish', include_deferred=True))
+        self.assertEqual(self.store.stats(self.client.uid, 0)['attempts'], 1)
+        self.assertEqual(self.store.latest_browse_decision(self.client.uid)['next_check_at'], self.now + 600)
+        self.assertEqual(await self.engine.next_check_delay(), 600)
         self.now += self.cfg.comment.min_interval_seconds
+        self.client.recommended.return_value = []  # 不再推荐的视频也会重新读取、判断后发送。
         self.assertIn('已提交评论', await self.engine.round())
         self.client.publish.assert_awaited_once()
+        self.assertEqual(self.client.understand.await_count, 2)
+        self.assertEqual(self.generate.await_count, 4)
+        self.assertEqual(self.store.deferred_videos(self.client.uid), [])
+
+    async def test_cooldown_reads_full_round_and_skips_deferred_videos_on_later_rounds(self):
+        await self.engine.start()
+        self.store.reserve(self.client.uid, 'BV0987654321', '不重复的已有评论', self.now, 0, 12, 0, .88)
+        self.store.finish(self.client.uid, 'BV0987654321', 'sent', '1')
+        items = [replace(ITEM, bvid=f'BV{i:010}') for i in range(3)]
+        self.client.recommended.return_value = items
+        self.client.understand.side_effect = [(item, EVIDENCE) for item in items]
+        await self.engine.round()
+        self.assertEqual(self.client.understand.await_count, 3)
+        self.assertEqual(self.generate.await_count, 3)
+        self.assertEqual(len(self.store.deferred_videos(self.client.uid)), 3)
+        # 保留队列超过 deferred_videos 的单次读取上限后，也不能重复分析旧视频。
+        for i in (3, 4):
+            self.now += 600
+            fresh = replace(ITEM, bvid=f'BV{i:010}')
+            items.append(fresh)
+            self.client.recommended.return_value = list(items)
+            self.client.understand.side_effect = [(fresh, EVIDENCE)]
+            await self.engine.round()
+            self.assertEqual(self.client.understand.await_count, i + 1)
+        self.assertEqual(self.store.stats(self.client.uid, 0)['views'], 5)
+        self.assertEqual(self.store.stats(self.client.uid, 0)['attempts'], 1)
+        self.client.publish.assert_not_awaited()
+        self.assertFalse(self.engine.paused)
+
+    async def test_cooldown_still_respects_autonomous_rest(self):
+        await self.engine.start()
+        self.store.reserve(self.client.uid, 'BV0987654321', '不重复的已有评论', self.now, 0, 12, 0, .88)
+        self.store.finish(self.client.uid, 'BV0987654321', 'sent', '1')
+        self.cfg.browse.autonomous_enabled = True
+        self.store.record_browse_decision(self.client.uid, self.now, False, '先休息', self.now + 1800)
+        self.assertIn('尚未到下次', await self.engine.round())
+        self.client.recommended.assert_not_awaited()
+        self.generate.assert_not_awaited()
+        self.client.publish.assert_not_awaited()
+
+    async def test_cooldown_can_read_without_wanting_to_comment(self):
+        await self.engine.start()
+        self.store.reserve(self.client.uid, 'BV0987654321', '不重复的已有评论', self.now, 0, 12, 0, .88)
+        self.store.finish(self.client.uid, 'BV0987654321', 'sent', '1')
+        self.generate.return_value = decision(should_comment=False, comment='')
+        self.assertIn('看过不评论', await self.engine.round())
+        self.client.understand.assert_awaited_once()
+        self.assertTrue(self.store.seen(self.client.uid, ITEM.bvid, 'publish'))
+        self.assertEqual(self.store.deferred_videos(self.client.uid), [])
+        self.client.publish.assert_not_awaited()
 
     async def test_manual_preview_can_run_during_comment_cooldown(self):
         await self.engine.start()
@@ -418,7 +477,9 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                                                   0, 8, 900, 3, .88), 'reserved')
         self.store.finish_reply(self.client.uid, 900, 'sent', '501')
         self.assertIn('12:45:00', await self.engine.round())
-        self.generate.assert_not_awaited()
+        self.client.recommended.assert_awaited_once()
+        self.client.understand.assert_awaited_once()
+        self.generate.assert_awaited_once()
         self.client.publish.assert_not_awaited()
 
     async def test_concurrent_send_defers_video_preserves_details_and_retries_after_restart(self):

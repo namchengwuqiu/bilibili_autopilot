@@ -98,6 +98,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
     async def _generate(self, prompt: Any, cfg: AutopilotConfig) -> str:
         # 沿用 Host 任务的输出额度；思考模型可能先消耗大量 token 才返回 JSON 正文。
         candidates = cfg.model.candidates or [""]
+        response_error = None
         for index, model in enumerate(candidates):
             try:
                 # 每个模型单独计时，不能在引擎外层用单模型时限截断整个切换流程。
@@ -112,13 +113,20 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
                         raise ModelTimeoutError("模型调用超时")
                 return self._model_text(response)
             except (asyncio.TimeoutError, httpx.TimeoutException, ModelTimeoutError):
-                pass
+                reason = "调用超时"
+            except ModelResponseError as exc:
+                response_error = exc
+                reason = str(exc)
             except Exception as exc:
                 # SDK 的 RPC 超时不是 TimeoutError，而是带 E_TIMEOUT 代码的异常。
                 if getattr(exc, "code", None) != "E_TIMEOUT":
                     raise
-            self.ctx.logger.warning("B站模型调用超时：%s（候选 %s/%s）；%s", model or cfg.model.task, index + 1, len(candidates),
-                                    "切换下一个模型" if index + 1 < len(candidates) else "本次跳过，后续继续调度")
+                reason = "调用超时"
+            if index + 1 < len(candidates):
+                self.ctx.logger.warning("B站模型未返回有效正文：%s（候选 %s/%s）；%s；切换下一个模型",
+                                        model or cfg.model.task,index+1,len(candidates),reason)
+        if response_error is not None:
+            raise ModelResponseError(f"候选模型未返回有效正文：{response_error}；本次跳过，后续有限重查")
         raise ModelTimeoutError("候选模型均超时，本次跳过；自动运行保持开启，下轮继续")
 
     async def _compose_share(self, uid: str, item: VideoItem, cfg: AutopilotConfig) -> str:
@@ -222,8 +230,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             "unresolved": "、".join(stats["unresolved"]) or "无",
             "pause_reason": self.engine.pause_reason or "无",
             "choice": ("去浏览：" if choice["should_browse"] else "暂时不刷：") + choice["reason"] if choice else "尚未产生自主决定",
-            "next_check": ("已暂停，恢复后重新检查" if self.engine.paused else
-                           local_time(self.engine.next_check_time(choice, cfg), cfg.browse.timezone) if choice else "等待首次判断"),
+            "next_check": self.engine.next_check_status(choice, cfg),
             "check_range": f"{(cfg.browse.interval_seconds + 59) // 60}～{cfg.browse.max_check_minutes} 分钟",
             "job": f"执行中：{self._job_action}" if busy else "暂无手动任务",
             "operation": self._last_operation,

@@ -7,21 +7,21 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`。配置格式版本 `plugin.config_version=0.1.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本：`0.6.0`；当前发布版本：`0.6.3`。配置格式版本 `plugin.config_version=0.1.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
 1. 在公开仓库默认分支的根目录提交源码和资源，确保 `_manifest.json`、`plugin.py`、`README.md`、`LICENSE` 都位于根目录。
-2. 运行 `python scripts/validate_release.py --tag v0.6.0`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
+2. 运行 `python scripts/validate_release.py --tag v0.6.3`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
 3. 确认源码仓库不包含 `config.toml`、`config_back/`、登录凭据、二维码、数据库及运行数据。默认示例仅使用 `config.example.toml`。
-4. 创建并推送 `v0.6.0` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
+4. 创建并推送 `v0.6.3` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
 5. 确认 Release 已公开发布，随后按 [市场登记文案](MARKETPLACE_SUBMISSION.md) 在插件中心创建新增插件 Issue。
 6. 等待市场验证、同步及审核收录。只有仓库代码或 Tag 不满足首次登记要求，草稿 Release 也不满足要求。
 
 手动生成用于检查的发布附件：
 
 ```sh
-python scripts/validate_release.py --tag v0.6.0 \
+python scripts/validate_release.py --tag v0.6.3 \
   --archive dist/bilibili-autopilot.zip --notes dist/release-notes.md
 ```
 
@@ -41,3 +41,12 @@ ZIP 根目录直接包含插件文件，不套多层目录。脚本使用固定�
 工作流只使用仓库自身的 `GITHUB_TOKEN`，不需要配置 B 站 Cookie、模型密钥或个人 GitHub Token。Release job 需要仓库允许 Actions 写入 contents 的权限。
 
 官方规则：[插件中心贡献指南](https://github.com/Mai-with-u/plugin-repo/blob/main/CONTRIBUTING.md)。
+
+
+## 0.6.3 升级与验证
+
+- 更新插件源码或 Release ZIP 时，保留本地 `config.toml` 与 Host 提供的插件数据目录；配置格式版本仍为 `0.1.0`，不需要重新扫码或清空历史。
+- 插件加载时自动为现有 SQLite 数据库补充状态时间、分析计数和有限重查字段；旧时间只补入能够由发送记录确认的部分。可在升级前备份数据目录，避免丢失登录态及去重历史。
+- 检查管理页是否显示首次时间、更新时间、发送尝试时间及重查状态。冷却期间仍可分析新视频；临时失败按至少 10、20 分钟的间隔最多重查两次，重启不重置次数。
+- 横向滚动修复位于 MaiBot 主程序 WebUI（[PR #2208](https://github.com/Mai-with-u/MaiBot/pull/2208)，目前待合并）；本插件发布包不包含宿主前端。部署包含该修复的 WebUI 完整构建产物后再刷新页面，检查右侧“失败重查状态”等字段可以通过左右滚动到达。不要只覆盖同名、带长期缓存的单个 JS 或 CSS 文件。
+- 自动化验证仅使用模拟平台响应和临时数据库，不访问真实账号或发送评论、回复、群消息。GitHub Actions 在 Python 3.10、3.13 上执行完整测试，发布任务再次运行测试后创建 Release。

@@ -589,6 +589,10 @@
               ]
             },
             {
+              "type": "text",
+              "value": "表格支持左右滚动，可查看全部字段。"
+            },
+            {
               "type": "table",
               "value": {
                 "source": "records",
@@ -597,7 +601,19 @@
               "columns": [
                 {
                   "field": "time",
-                  "label": "时间"
+                  "label": "状态 / 发送记录时间"
+                },
+                {
+                  "field": "first_time",
+                  "label": "首次浏览 / 收到时间"
+                },
+                {
+                  "field": "updated_time",
+                  "label": "状态更新时间"
+                },
+                {
+                  "field": "send_time",
+                  "label": "发送尝试时间"
                 },
                 {
                   "field": "title",
@@ -630,6 +646,10 @@
                 {
                   "field": "rpid",
                   "label": "评论 / 群消息 ID"
+                },
+                {
+                  "field": "retry_status",
+                  "label": "失败重查状态"
                 }
               ],
               "when": {
@@ -658,7 +678,19 @@
               "columns": [
                 {
                   "field": "time",
-                  "label": "时间"
+                  "label": "状态 / 发送记录时间"
+                },
+                {
+                  "field": "first_time",
+                  "label": "首次浏览 / 收到时间"
+                },
+                {
+                  "field": "updated_time",
+                  "label": "状态更新时间"
+                },
+                {
+                  "field": "send_time",
+                  "label": "发送尝试时间"
                 },
                 {
                   "field": "bvid",
@@ -691,6 +723,10 @@
                 {
                   "field": "rpid",
                   "label": "跟进评论 ID"
+                },
+                {
+                  "field": "retry_status",
+                  "label": "失败重查状态"
                 }
               ]
             },
@@ -704,7 +740,7 @@
             },
             {
               "type": "text",
-              "value": "按当前登录账号显示，每页 20 条。拟写评论不代表已发布，实际发送结果请切换到“实际评论发送记录”。 顶部检查时间按当前间隔配置计算，历史表保留当时原定的时间。"
+              "value": "按当前登录账号显示，每页 20 条。浏览和收到回复记录按状态更新时间展示；首次时间与发送尝试时间分别列出。历史更新时间只补入可确认的发送时间。失败最多重查两次，间隔至少 10、20 分钟；拟写评论不代表已发布。顶部检查时间按当前配置计算。"
             }
           ]
         },

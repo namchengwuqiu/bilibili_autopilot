@@ -4,13 +4,19 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import hashlib
 import json
 import sqlite3
+import time
 
 from .models import IncomingReply, VideoItem, normalized
+
+
+RETRY_OUTCOMES = {"read_error", "model_error", "model_timeout", "invalid_decision"}
+MAX_FAILURES = 3  # 首次失败之后，最多再检查两次。
+RETRY_INTERVAL = 600
 
 
 class StateStore:
@@ -27,9 +33,11 @@ class StateStore:
         finally:
             conn.close()
 
-    def initialize(self) -> None:
+    def initialize(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
+            seed_analyses = not db.execute("SELECT 1 FROM sqlite_master WHERE name='analyses'").fetchone()
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 INSERT OR IGNORE INTO meta VALUES ('paused', '1');
@@ -84,15 +92,75 @@ class StateStore:
                     detail TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(uid,bvid,group_id)
                 );
+                CREATE TABLE IF NOT EXISTS analyses (
+                    id INTEGER PRIMARY KEY, uid TEXT NOT NULL, kind TEXT NOT NULL,
+                    item_id TEXT NOT NULL, mode TEXT NOT NULL, ts REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS analyses_account_time ON analyses(uid,kind,ts);
             """)
+            for table in ("visits", "reply_decisions"):
+                columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                for column, declaration in (("updated_at", "REAL NOT NULL DEFAULT 0"),
+                                            ("failures", "INTEGER NOT NULL DEFAULT 0"),
+                                            ("retry_at", "REAL NOT NULL DEFAULT 0")):
+                    if column not in columns:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+                if "updated_at" not in columns:
+                    db.execute(f"UPDATE {table} SET updated_at=ts")
+                    # 旧记录只有首次时间；能从发送意图确认的后续时间才补入。
+                    if table == "visits":
+                        db.execute("UPDATE visits SET updated_at=max(ts,coalesce((SELECT a.ts FROM attempts a "
+                                   "WHERE a.uid=visits.uid AND a.bvid=visits.bvid AND visits.mode='publish'),ts))")
+                    else:
+                        db.execute("UPDATE reply_decisions SET updated_at=max(ts,coalesce((SELECT a.ts FROM reply_attempts a "
+                                   "WHERE a.uid=reply_decisions.uid AND a.source_rpid=reply_decisions.source_rpid "
+                                   "AND reply_decisions.mode='publish'),ts))")
+                    db.execute(f"UPDATE {table} SET failures=1 "
+                               "WHERE outcome IN ('read_error','model_error','model_timeout','invalid_decision')")
+                    retry_filter = "outcome IN ('model_error','model_timeout','invalid_decision')"
+                    if table == 'visits':
+                        retry_filter += (" OR (outcome='read_error' AND (detail LIKE '%-504%' "
+                                         "OR detail LIKE '%超时%' OR detail LIKE '%网络连接失败%'))")
+                    db.execute(f"UPDATE {table} SET retry_at=updated_at+? WHERE {retry_filter}", (RETRY_INTERVAL,))
+            if seed_analyses:
+                db.execute("INSERT INTO analyses(uid,kind,item_id,mode,ts) SELECT uid,'video',bvid,mode,ts FROM visits")
+                db.execute("INSERT INTO analyses(uid,kind,item_id,mode,ts) "
+                           "SELECT uid,'reply',cast(source_rpid AS TEXT),mode,ts FROM reply_decisions")
+            db.execute("CREATE INDEX IF NOT EXISTS visits_updated ON visits(uid,updated_at)")
             # 请求发出前已落盘；进程中断后无法知道平台是否接收，绝不重试该视频。
             db.execute("UPDATE attempts SET status='unknown' WHERE status='pending'")
             db.execute("UPDATE reply_attempts SET status='unknown' WHERE status='pending'")
             # 旧版把未发送的模型超时记录为终态失败；允许后续检查重新判断。
             db.execute("UPDATE reply_decisions SET outcome='model_timeout' "
                        "WHERE outcome='model_error' AND reason='模型调用失败：TimeoutError'")
+            self._recover_interrupted(db, now)
             db.execute("UPDATE video_shares SET status='unknown',detail='进程中断，群分享结果待核对；不会自动重发' WHERE status='pending'")
         self.path.chmod(0o600)
+
+    def _recover_interrupted(self, db: sqlite3.Connection, now: float) -> None:
+        # reading 已计入分析额度；中断计一次失败，不因反复重载重置重查上限。
+        for table, attempts, key, outcome, field in (
+            ('visits', 'attempts', 'bvid', 'read_error', 'detail'),
+            ('reply_decisions', 'reply_attempts', 'source_rpid', 'model_error', 'reason'),
+        ):
+            rows = db.execute(f"SELECT d.* FROM {table} d WHERE d.outcome='reading' "
+                              f"AND NOT EXISTS(SELECT 1 FROM {attempts} a WHERE a.uid=d.uid AND a.{key}=d.{key})").fetchall()
+            for row in rows:
+                failures = row['failures'] + 1
+                retry_at = now + RETRY_INTERVAL * failures if failures < MAX_FAILURES else 0
+                reason = '上次分析因任务或进程中断未完成，尚未尝试发送'
+                if table == 'visits':
+                    try:
+                        detail = json.loads(row['detail'])
+                    except (ValueError, TypeError):
+                        detail = {}
+                    if not isinstance(detail, dict):
+                        detail = {}
+                    detail['reason'] = reason
+                    reason = json.dumps(detail, ensure_ascii=False)
+                db.execute(f"UPDATE {table} SET outcome=?,{field}=?,updated_at=?,failures=?,retry_at=? "
+                           f"WHERE uid=? AND {key}=? AND mode=?",
+                           (outcome, reason, now, failures, retry_at, row['uid'], row[key], row['mode']))
 
     def set_pause(self, paused: bool, reason: str, kind: str = "error") -> None:
         with self.connect() as db:
@@ -139,37 +207,85 @@ class StateStore:
         with self.connect() as db:
             return {row["key"]: row["value"] for row in db.execute("SELECT key, value FROM meta")}
 
-    def visit(self, uid: str, bvid: str, mode: str, ts: float, outcome: str, detail: str) -> None:
+    def visit(self, uid: str, bvid: str, mode: str, ts: float, outcome: str, detail: str,
+              retryable: Optional[bool] = None) -> None:
         with self.connect() as db:
-            db.execute("INSERT INTO visits VALUES (?, ?, ?, ?, ?, ?) "
-                       "ON CONFLICT(uid,bvid,mode) DO UPDATE SET outcome=excluded.outcome, detail=excluded.detail",
-                       (uid, bvid, mode, ts, outcome, detail))
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute("SELECT failures FROM visits WHERE uid=? AND bvid=? AND mode=?", (uid,bvid,mode)).fetchone()
+            failures = previous['failures'] if previous else 0
+            if outcome in RETRY_OUTCOMES:
+                failures += 1
+            if retryable is None:
+                retryable = outcome in RETRY_OUTCOMES
+            retry_at = ts + RETRY_INTERVAL * max(1, failures) if retryable and failures < MAX_FAILURES else 0
+            db.execute("INSERT INTO visits(uid,bvid,mode,ts,outcome,detail,updated_at,failures,retry_at) VALUES (?,?,?,?,?,?,?,?,?) "
+                       "ON CONFLICT(uid,bvid,mode) DO UPDATE SET outcome=excluded.outcome,detail=excluded.detail,"
+                       "updated_at=excluded.updated_at,failures=excluded.failures,retry_at=excluded.retry_at",
+                       (uid,bvid,mode,ts,outcome,detail,ts,failures,retry_at))
+            if outcome == 'reading' or previous is None:
+                db.execute("INSERT INTO analyses(uid,kind,item_id,mode,ts) VALUES (?,'video',?,?,?)", (uid,bvid,mode,ts))
 
-    def seen(self, uid: str, bvid: str, mode: str) -> bool:
+    def seen(self, uid: str, bvid: str, mode: str, include_deferred: bool = False,
+             now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
         with self.connect() as db:
-            return bool(db.execute("SELECT 1 FROM visits WHERE uid=? AND bvid=? AND mode=? "
-                                   "AND outcome!='deferred' AND NOT (outcome='blocked' AND detail='cooldown')",
-                                   (uid, bvid, mode)).fetchone() or
-                        db.execute("SELECT 1 FROM attempts WHERE uid=? AND bvid=?", (uid, bvid)).fetchone())
+            if db.execute("SELECT 1 FROM attempts WHERE uid=? AND bvid=?", (uid,bvid)).fetchone():
+                return True
+            row = db.execute("SELECT * FROM visits WHERE uid=? AND bvid=? AND mode=?", (uid,bvid,mode)).fetchone()
+            if row is None:
+                return False
+            if row['outcome'] == 'deferred' or (row['outcome'] == 'blocked' and row['detail'] == 'cooldown'):
+                return include_deferred
+            return not (row['outcome'] in RETRY_OUTCOMES and row['failures'] < MAX_FAILURES
+                        and 0 < row['retry_at'] <= now)
 
-    def deferred_videos(self, uid: str) -> List[VideoItem]:
+    def retry_videos(self, uid: str, mode: str, now: float,
+                     eligible: Optional[Callable[[VideoItem], bool]] = None) -> List[VideoItem]:
+        with self.connect() as db:
+            rows = db.execute("SELECT v.detail FROM visits v WHERE v.uid=? AND v.mode=? "
+                              "AND v.outcome IN ('read_error','model_error','model_timeout','invalid_decision') "
+                              "AND v.failures<? AND v.retry_at>0 AND v.retry_at<=? "
+                              "AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.uid=v.uid AND a.bvid=v.bvid) "
+                              "ORDER BY v.retry_at", (uid,mode,MAX_FAILURES,now))
+            result = []
+            for row in rows:
+                detail = json.loads(row['detail']) if row['detail'].startswith('{') else {}
+                # 旧版未保存视频元数据，只能等待该视频再次被推荐。
+                if isinstance(detail,dict) and 'video' in detail:
+                    item = VideoItem(**detail['video'])
+                    if eligible is not None and not eligible(item):
+                        continue
+                    result.append(item)
+                    if len(result) == 3:
+                        break
+            return result
+
+    def deferred_videos(self, uid: str, eligible: Optional[Callable[[VideoItem], bool]] = None) -> List[VideoItem]:
         """只恢复明确未发送的冷却视频；已占用发送机会的视频永不重试。"""
         with self.connect() as db:
             rows = db.execute("SELECT v.detail FROM visits v WHERE v.uid=? AND v.mode='publish' "
                               "AND v.outcome='deferred' AND NOT EXISTS "
                               "(SELECT 1 FROM attempts a WHERE a.uid=v.uid AND a.bvid=v.bvid) "
-                              "ORDER BY v.ts LIMIT 3", (uid,)).fetchall()
-            return [VideoItem(**json.loads(row['detail'])['video']) for row in rows]
+                              "ORDER BY v.ts", (uid,))
+            result = []
+            for row in rows:
+                item = VideoItem(**json.loads(row['detail'])['video'])
+                if eligible is not None and not eligible(item):
+                    continue
+                result.append(item)
+                if len(result) == 3:
+                    break
+            return result
 
     def stats(self, uid: str, day_start: float) -> Dict[str, Any]:
         with self.connect() as db:
-            views = db.execute("SELECT count(*) FROM visits WHERE uid=? AND ts>=?", (uid, day_start)).fetchone()[0]
+            views = db.execute("SELECT count(*) FROM analyses WHERE uid=? AND kind='video' AND ts>=?", (uid,day_start)).fetchone()[0]
             attempts = db.execute("SELECT count(*) FROM attempts WHERE uid=? AND ts>=?", (uid, day_start)).fetchone()[0]
             unresolved = [r[0] for r in db.execute("SELECT bvid FROM attempts WHERE uid=? AND status IN ('pending','unknown')", (uid,))]
             last = db.execute("SELECT coalesce(max(ts),0) FROM attempts WHERE uid=?", (uid,)).fetchone()[0]
             unresolved += [r[0] for r in db.execute("SELECT bvid FROM reply_attempts WHERE uid=? AND status IN ('pending','unknown')", (uid,))]
             reply_attempts = db.execute("SELECT count(*) FROM reply_attempts WHERE uid=? AND ts>=?", (uid,day_start)).fetchone()[0]
-            reply_analyses = db.execute("SELECT count(*) FROM reply_decisions WHERE uid=? AND ts>=?", (uid,day_start)).fetchone()[0]
+            reply_analyses = db.execute("SELECT count(*) FROM analyses WHERE uid=? AND kind='reply' AND ts>=?", (uid,day_start)).fetchone()[0]
             reply_last = db.execute("SELECT coalesce(max(ts),0) FROM reply_attempts WHERE uid=?", (uid,)).fetchone()[0]
             return {"views": views, "attempts": attempts, "unresolved": sorted(set(unresolved)), "last_attempt": max(last, reply_last),
                     "reply_attempts": reply_attempts, "reply_analyses": reply_analyses}
@@ -201,21 +317,36 @@ class StateStore:
             db.executemany("INSERT OR IGNORE INTO reply_inbox VALUES (?,?,?,?,?,?)",
                 [(uid,m.source_rpid,m.bvid,m.root_rpid,m.received_at,json.dumps(asdict(m),ensure_ascii=False)) for m in messages])
 
-    def pending_replies(self, uid: str, mode: str, since: float) -> List[IncomingReply]:
+    def pending_replies(self, uid: str, mode: str, since: float,
+                        now: Optional[float] = None) -> List[IncomingReply]:
+        now = time.time() if now is None else now
         with self.connect() as db:
             rows = db.execute("SELECT i.payload FROM reply_inbox i WHERE i.uid=? AND i.received_at>=? "
                 "AND NOT EXISTS(SELECT 1 FROM reply_decisions d WHERE d.uid=i.uid AND d.source_rpid=i.source_rpid AND d.mode=? "
-                "AND d.outcome!='model_timeout' AND NOT (d.outcome='blocked' AND d.reason='cooldown')) "
+                "AND NOT (d.outcome IN ('model_timeout','model_error','invalid_decision') AND d.failures<? "
+                "AND d.retry_at>0 AND d.retry_at<=?) AND NOT (d.outcome='blocked' AND d.reason='cooldown')) "
                 "AND NOT EXISTS(SELECT 1 FROM reply_attempts a WHERE a.uid=i.uid AND a.source_rpid=i.source_rpid) "
-                "ORDER BY i.received_at,i.source_rpid LIMIT 3", (uid,since,mode))
+                "ORDER BY i.received_at,i.source_rpid LIMIT 3", (uid,since,mode,MAX_FAILURES,now))
             return [IncomingReply(**json.loads(r[0])) for r in rows]
 
     def decide_reply(self, uid: str, source_rpid: int, mode: str, ts: float, outcome: str,
                      text: str = "", reason: str = "") -> None:
         with self.connect() as db:
-            db.execute("INSERT INTO reply_decisions VALUES (?,?,?,?,?,?,?) ON CONFLICT(uid,source_rpid,mode) "
-                "DO UPDATE SET outcome=excluded.outcome,text=excluded.text,reason=excluded.reason",
-                (uid,source_rpid,mode,ts,outcome,text,reason[:500]))
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute("SELECT failures FROM reply_decisions WHERE uid=? AND source_rpid=? AND mode=?",
+                                  (uid,source_rpid,mode)).fetchone()
+            failures = previous['failures'] if previous else 0
+            if outcome in RETRY_OUTCOMES:
+                failures += 1
+            retry_at = ts + RETRY_INTERVAL * max(1,failures) if outcome in RETRY_OUTCOMES and failures < MAX_FAILURES else 0
+            db.execute("INSERT INTO reply_decisions(uid,source_rpid,mode,ts,outcome,text,reason,updated_at,failures,retry_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uid,source_rpid,mode) "
+                "DO UPDATE SET outcome=excluded.outcome,text=excluded.text,reason=excluded.reason,"
+                "updated_at=excluded.updated_at,failures=excluded.failures,retry_at=excluded.retry_at",
+                (uid,source_rpid,mode,ts,outcome,text,reason[:500],ts,failures,retry_at))
+            if outcome == 'reading' or previous is None:
+                db.execute("INSERT INTO analyses(uid,kind,item_id,mode,ts) VALUES (?,'reply',?,?,?)",
+                           (uid,str(source_rpid),mode,ts))
 
     def reply_thread_count(self, uid: str, root_rpid: int) -> int:
         with self.connect() as db:
@@ -235,7 +366,7 @@ class StateStore:
 
     def browse_context(self, uid: str) -> List[Dict[str, Any]]:
         with self.connect() as db:
-            rows = db.execute("SELECT bvid,mode,ts,outcome,detail FROM visits WHERE uid=? ORDER BY ts DESC LIMIT 6", (uid,))
+            rows = db.execute("SELECT bvid,mode,updated_at AS ts,outcome,detail FROM visits WHERE uid=? ORDER BY updated_at DESC LIMIT 6", (uid,))
             result = []
             for row in rows:
                 try:
@@ -283,27 +414,45 @@ class StateStore:
             total = db.execute(f"SELECT count(*) FROM {table} WHERE {where}", args).fetchone()[0]
             pages = max(1, (total + 19) // 20)
             page = min(page, pages)
-            ordering = "received_at" if kind == "replies" else "ts"
+            ordering = "received_at" if kind == "replies" else "updated_at" if kind == "visits" else "ts"
+            if kind == 'replies':
+                ordering = ("coalesce((SELECT d.updated_at FROM reply_decisions d WHERE d.uid=reply_inbox.uid "
+                            "AND d.source_rpid=reply_inbox.source_rpid ORDER BY CASE d.mode WHEN 'publish' "
+                            "THEN 0 ELSE 1 END LIMIT 1),received_at)")
             rows = db.execute(f"SELECT * FROM {table} WHERE {where} ORDER BY {ordering} DESC LIMIT 20 OFFSET ?",
                               [*args, (page - 1) * 20]).fetchall()
             result = []
             for row in rows:
                 item = dict(row)
-                if kind == "attempts":
-                    visit = db.execute("SELECT detail FROM visits WHERE uid=? AND bvid=? ORDER BY ts DESC LIMIT 1",
-                                       (uid, item["bvid"])).fetchone()
-                    item["detail"] = visit["detail"] if visit else ""
+                if kind in {"visits", "attempts"}:
+                    if kind == 'attempts':
+                        visit = db.execute("SELECT * FROM visits WHERE uid=? AND bvid=? "
+                                           "ORDER BY CASE mode WHEN 'publish' THEN 0 ELSE 1 END,updated_at DESC LIMIT 1",
+                                           (uid,item['bvid'])).fetchone()
+                        item['detail'] = visit['detail'] if visit else ''
+                        if visit:
+                            item.update(first_ts=visit['ts'],updated_at=visit['updated_at'])
+                        item['send_ts'] = item['ts']
+                    else:
+                        item['first_ts'] = item['ts']
+                        if item['mode'] == 'publish':
+                            attempt = db.execute("SELECT ts FROM attempts WHERE uid=? AND bvid=?", (uid,item['bvid'])).fetchone()
+                            if attempt:
+                                item['send_ts'] = attempt['ts']
                 if kind in {"replies", "reply_attempts"}:
                     if kind == "reply_attempts":
                         inbox = db.execute("SELECT payload FROM reply_inbox WHERE uid=? AND source_rpid=?", (uid,item['source_rpid'])).fetchone()
                         item['payload'] = inbox[0] if inbox else '{}'
-                    decision = db.execute("SELECT mode,outcome,text,reason FROM reply_decisions WHERE uid=? AND source_rpid=? "
+                    decision = db.execute("SELECT mode,outcome,text,reason,ts,updated_at,failures,retry_at "
+                        "FROM reply_decisions WHERE uid=? AND source_rpid=? "
                         "ORDER BY CASE mode WHEN 'publish' THEN 0 ELSE 1 END LIMIT 1", (uid,item['source_rpid'])).fetchone()
                     item['decision'] = dict(decision) if decision else {}
                     if kind == 'replies':
-                        attempt = db.execute("SELECT status,rpid FROM reply_attempts WHERE uid=? AND source_rpid=?", (uid,item['source_rpid'])).fetchone()
+                        attempt = db.execute("SELECT status,rpid,ts FROM reply_attempts WHERE uid=? AND source_rpid=?", (uid,item['source_rpid'])).fetchone()
                         if attempt:
-                            item.update(status=attempt['status'],rpid=attempt['rpid'])
+                            item.update(status=attempt['status'],rpid=attempt['rpid'],send_ts=attempt['ts'])
+                    else:
+                        item['send_ts'] = item['ts']
                 result.append(item)
         return {"rows": result, "pagination": {"page": page, "pages": pages, "total": total}}
 
@@ -398,11 +547,11 @@ class StateStore:
 
     def history(self, uid: str) -> str:
         with self.connect() as db:
-            rows = db.execute("SELECT bvid,mode,outcome,detail FROM visits WHERE uid=? ORDER BY ts DESC LIMIT 8", (uid,))
+            rows = db.execute("SELECT bvid,mode,outcome,detail FROM visits WHERE uid=? ORDER BY updated_at DESC LIMIT 8", (uid,))
             visits = "\n".join(f"{r['bvid']} [{r['mode']}/{r['outcome']}] {r['detail'][:200]}" for r in rows) or "暂无浏览记录"
             choices = db.execute("SELECT should_browse,reason FROM browse_decisions WHERE uid=? ORDER BY id DESC LIMIT 3", (uid,))
             decisions = "\n".join(f"自主决定：{'去浏览' if r['should_browse'] else '暂时不刷'}；{r['reason']}" for r in choices)
             reply_rows = db.execute("SELECT i.bvid,d.outcome,d.text,d.reason FROM reply_inbox i JOIN reply_decisions d "
-                "ON d.uid=i.uid AND d.source_rpid=i.source_rpid WHERE i.uid=? ORDER BY d.ts DESC LIMIT 3", (uid,))
+                "ON d.uid=i.uid AND d.source_rpid=i.source_rpid WHERE i.uid=? ORDER BY d.updated_at DESC LIMIT 3", (uid,))
             replies = '\n'.join(f"{r['bvid']} [跟进/{r['outcome']}] {r['text'] or r['reason']}" for r in reply_rows)
             return '\n'.join(part for part in (replies,decisions,visits) if part)

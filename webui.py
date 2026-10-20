@@ -7,10 +7,11 @@ from zoneinfo import ZoneInfo
 import json
 
 from .sharing import SHARE_OUTCOMES
+from .state import MAX_FAILURES, RETRY_OUTCOMES
 
 
 OUTCOMES = {
-    "reading": "正在读取", "read_error": "读取失败", "model_error": "模型调用失败", "model_timeout": "模型超时，等待下次检查",
+    "reading": "正在读取", "read_error": "读取失败", "model_error": "模型调用失败", "model_timeout": "模型超时",
     "invalid_decision": "判断校验失败", "skipped": "看过不评论 / 跳过", "would_comment": "拟发表评论",
     "sent": "已提交评论", "rejected": "平台拒绝", "unknown": "发送结果待核对",
     "pending": "发送中", "cancelled": "已取消", "acknowledged": "已人工核对", "blocked": "发送被拦截",
@@ -32,7 +33,14 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
     result = {"time": local_time(row.get("ts",row.get("received_at")), timezone), "title": "", "bvid": "", "url": "",
               "outcome": "", "mode": "", "interest": "", "comment": "", "reason": "",
               "source": "", "rpid": "", "summary": "", "next_time": ""}
-    result.update(sender='',incoming='',target='',source_rpid='')
+    result.update(sender='',incoming='',target='',source_rpid='',first_time='',updated_time='',send_time='',retry_status='')
+    for field, timestamp in (('first_time',row.get('first_ts')),('updated_time',row.get('updated_at')),
+                             ('send_time',row.get('send_ts'))):
+        if timestamp is not None:
+            result[field] = local_time(timestamp,timezone)
+    if kind == 'visits' and row.get('updated_at') is not None:
+        result['time'] = result['updated_time']
+    result['retry_status'] = retry_status(row,timezone)
     if kind == "shares":
         result.update(title=row['title'],bvid=row['bvid'],url='https://www.bilibili.com/video/'+row['bvid'],
                       outcome=SHARE_OUTCOMES.get(row['status'],row['status']),mode='评论后群分享',
@@ -43,6 +51,9 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
         message = json.loads(row['payload'])
         decision = row['decision']
         outcome = row.get('status') or decision.get('outcome','new')
+        result.update(first_time=local_time(message.get('received_at',row.get('received_at',0)),timezone),
+                      updated_time=local_time(decision['updated_at'],timezone) if decision.get('updated_at') is not None else '',
+                      retry_status=retry_status(decision,timezone))
         result.update(time=local_time(row.get('ts',row.get('received_at')),timezone),
             title='跟进讨论',bvid=row['bvid'],url='https://www.bilibili.com/video/'+row['bvid'],
             sender=message.get('sender_name',''),incoming=message.get('text',''),target=message.get('target_text','')[:500],
@@ -50,6 +61,8 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
             mode='实际发送' if kind=='reply_attempts' else '预览' if decision.get('mode')=='preview' else '自动判断',
             comment=row['text'] if kind=='reply_attempts' else decision.get('text',''),
             reason=BLOCKS.get(decision.get('reason',''),decision.get('reason','')),rpid=row.get('rpid',''))
+        if kind == 'replies' and result['updated_time']:
+            result['time'] = result['updated_time']
         result['summary']=(result['comment'] or result['reason'])[:100]
         return result
     if kind == "decisions":
@@ -73,4 +86,17 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
                   reason=BLOCKS.get(str(detail.get("reason", row["detail"])), str(detail.get("reason", row["detail"]))),
                   rpid=row["rpid"] if kind == "attempts" else "")
     result["summary"] = (result["comment"] or result["reason"])[:100]
+    if detail.get('read_warning'):
+        result['reason'] += f"；读取提示：{detail['read_warning']}，已使用字幕"
     return result
+
+
+def retry_status(row: Dict[str, Any], timezone: str) -> str:
+    if row.get('outcome') not in RETRY_OUTCOMES:
+        return ''
+    failures = row.get('failures',0)
+    if failures >= MAX_FAILURES:
+        return f"已失败 {failures} 次，达到重查上限"
+    if row.get('retry_at',0) > 0:
+        return f"已失败 {failures} 次，{local_time(row['retry_at'],timezone)} 起可重查；最多再查 {MAX_FAILURES-failures} 次"
+    return '不自动重查，请检查错误原因'
