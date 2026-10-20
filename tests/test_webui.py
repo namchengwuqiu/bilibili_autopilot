@@ -192,6 +192,17 @@ class WebUITests(unittest.IsolatedAsyncioTestCase):
         row.update(status="sent", text="实际提交的评论", rpid="9")
         self.assertEqual(record_row(row, "attempts", "Asia/Shanghai")["rpid"], "9")
 
+    def test_deferred_record_keeps_title_draft_and_explains_wait(self):
+        row = {'ts': 1, 'bvid': ITEM.bvid, 'mode': 'publish', 'outcome': 'deferred',
+               'detail': json.dumps({'title': ITEM.title, 'comment': '待重新判断的评论', 'reason': '评论冷却中，最早12:45可再次评论'})}
+        result = record_row(row, 'visits', 'Asia/Shanghai')
+        self.assertEqual(result['outcome'], '冷却等待，下次重新判断')
+        self.assertEqual(result['title'], ITEM.title)
+        self.assertEqual(result['comment'], '待重新判断的评论')
+        self.assertIn('12:45', result['reason'])
+        row.update(outcome='blocked', detail=json.dumps({'title': ITEM.title, 'reason': 'daily_limit'}))
+        self.assertEqual(record_row(row, 'visits', 'Asia/Shanghai')['reason'], '今日评论额度已满')
+
 
 if __name__ == "__main__":
     unittest.main()

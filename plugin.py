@@ -207,6 +207,8 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             "account": f"{self.client.name}（UID {uid}）" if uid else "尚未登录，可在本页扫码登录",
             "state": "已暂停" if self.engine.paused else "自主运行中" if cfg.browse.autonomous_enabled else "定时运行中",
             "mode": "允许自动评论" if cfg.comment.publish_enabled else "仅预览评论",
+            "comment_cooldown": (self.engine.comment_cooldown(stats, cfg) or "已满足发送间隔")
+                                if cfg.comment.publish_enabled else "仅预览，不受发送冷却限制",
             "views": f"{stats['views']} / {cfg.browse.videos_per_day}",
             "attempts": f"{stats['attempts']} / {cfg.comment.per_day}",
             "replies": f"{stats['reply_attempts']} / {cfg.replies.per_day}（今日跟进发送尝试）",

@@ -287,7 +287,23 @@ class Autopilot:
         return cfg.plugin.enabled and cfg.comment.publish_enabled and not self.paused and self.active(cfg)
 
     async def record(self, uid: str, item: VideoItem, mode: str, outcome: str, detail: str) -> None:
+        # 纯文本状态也保留标题，避免管理页只剩 BV 号。
+        try:
+            fields = json.loads(detail)
+        except ValueError:
+            fields = {"reason": detail}
+        if not isinstance(fields, dict):
+            fields = {"reason": detail}
+        fields.setdefault("title", item.title)
+        detail = json.dumps(fields, ensure_ascii=False)
         await asyncio.to_thread(self.store.visit, uid, item.bvid, mode, self.clock(), outcome, detail)
+
+    def comment_cooldown(self, stats: Dict[str, Any], cfg: AutopilotConfig) -> str:
+        until = stats['last_attempt'] + cfg.comment.min_interval_seconds
+        if not stats['last_attempt'] or self.clock() >= until:
+            return ""
+        when = datetime.fromtimestamp(until, ZoneInfo(cfg.browse.timezone)).strftime("%m-%d %H:%M:%S")
+        return f"评论冷却中，最早 {when} 可再次评论；到期后自动检查，不会暂停"
 
     async def round(self, preview: bool = False) -> str:
         if self.lock.locked():
@@ -326,10 +342,15 @@ class Autopilot:
             await self.pause("存在待核对的评论发送结果")
             return "待核对评论：" + ", ".join(stats["unresolved"])
         mode = "publish" if cfg.comment.publish_enabled and not preview else "preview"
+        if mode == 'publish':
+            cooldown = self.comment_cooldown(stats, cfg)
+            if cooldown:
+                return cooldown
         remaining = min(cfg.browse.videos_per_round, cfg.browse.videos_per_day - stats["views"])
         if remaining <= 0:
             return "今日视频分析额度已用完"
         persona = await self.get_persona()
+        deferred = await asyncio.to_thread(self.store.deferred_videos, uid) if mode == 'publish' else []
         items = None
         if not preview and cfg.browse.autonomous_enabled:
             choice = await asyncio.to_thread(self.store.latest_browse_decision, uid)
@@ -337,6 +358,7 @@ class Autopilot:
                 return "尚未到下次自主浏览检查时间"
             # 到期后只先读取推荐元数据。决定去刷之前不读取字幕、调用内容模型或发送评论。
             items = await self.client.recommended()
+            items = deferred + [item for item in items if item.bvid not in {v.bvid for v in deferred}]
             candidates = []
             for item in items:
                 if not self.filter_item(item, cfg) and not await asyncio.to_thread(self.store.seen, uid, item.bvid, mode):
@@ -349,6 +371,7 @@ class Autopilot:
                 return "自主判断期间已暂停或配置、活动时段变化，本轮不浏览"
         if items is None:
             items = await self.client.recommended()
+            items = deferred + [item for item in items if item.bvid not in {v.bvid for v in deferred}]
         recent = await asyncio.to_thread(self.store.recent, uid)
         lines: List[str] = []
         commented_item = None
@@ -359,6 +382,12 @@ class Autopilot:
                 break
             if self.filter_item(item, cfg) or await asyncio.to_thread(self.store.seen, uid, item.bvid, mode):
                 continue
+            if mode == 'publish':
+                stats = await asyncio.to_thread(self.store.stats, uid, local_day_start(self.clock(), cfg.browse.timezone))
+                cooldown = self.comment_cooldown(stats, cfg)
+                if cooldown:
+                    lines.append(cooldown)
+                    break
             remaining -= 1
             await self.record(uid, item, mode, "reading", "正在读取视频内容")
             try:
@@ -432,7 +461,16 @@ class Autopilot:
                                                local_day_start(now, current.browse.timezone), current.comment.per_day,
                                                current.comment.min_interval_seconds, current.comment.similarity_threshold)
             if reserved != "reserved":
-                await self.record(uid, item, mode, "blocked", reserved)
+                fields = json.loads(detail)
+                fields.update(block_reason=reserved, decision_reason=fields['reason'], reason=reserved)
+                outcome = 'blocked'
+                if reserved == 'cooldown':
+                    outcome = 'deferred'
+                    fields['video'] = {"bvid": item.bvid, "aid": item.aid, "title": item.title,
+                                       "up_uid": item.up_uid, "up_name": item.up_name, "duration": item.duration}
+                    latest = await asyncio.to_thread(self.store.stats, uid, day_start)
+                    fields['reason'] = self.comment_cooldown(latest, current)
+                await self.record(uid, item, mode, outcome, json.dumps(fields, ensure_ascii=False))
                 lines.append(f"{item.bvid} 未发布：{reserved}")
                 break
             if not self.may_publish():
@@ -492,6 +530,7 @@ class Autopilot:
             f"；发送尝试：{stats['attempts']}/{cfg.comment.per_day}"
             f"\n跟进回复：{'开启' if cfg.replies.enabled else '关闭'}；今日发送尝试：{stats['reply_attempts']}/{cfg.replies.per_day}"
             f"；今日分析：{stats['reply_analyses']}/{cfg.replies.analyses_per_day}"
+            f"\n评论发送间隔：{self.comment_cooldown(stats, cfg) or '已满足发送间隔'}"
             f"\n待核对：{', '.join(stats['unresolved']) or '无'}\n暂停原因：{self.pause_reason or '无'}"
             f"{autonomy}\n最近结果：{self.last_result[:1200]}"
         )

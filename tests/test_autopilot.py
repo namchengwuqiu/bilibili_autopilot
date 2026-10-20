@@ -12,7 +12,7 @@ import unittest
 from local_bilibili_autopilot.client import PlatformError, UnknownPublish
 from local_bilibili_autopilot.config import AutopilotConfig
 from local_bilibili_autopilot.engine import Autopilot
-from local_bilibili_autopilot.models import (Evidence, ModelResponseError, ModelTimeoutError, VideoItem, active_time, local_day_start,
+from local_bilibili_autopilot.models import (Evidence, IncomingReply, ModelResponseError, ModelTimeoutError, VideoItem, active_time, local_day_start,
                                            parse_browse_decision, parse_decision, recommendations)
 from local_bilibili_autopilot.state import StateStore
 
@@ -376,10 +376,84 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.reserve(self.client.uid, "BV0987654321", "不重复的已有评论", self.now,
                                             0, 1, 3600, .88), "reserved")
         self.store.finish(self.client.uid, "BV0987654321", "sent", "existing")
+        self.now += 3601  # 单独验证每日限额，不受发送冷却影响。
         self.assertIn("daily_limit", await self.engine.round())
         self.client.recommended.assert_awaited_once()
         self.generate.assert_awaited_once()
         self.client.publish.assert_not_awaited()
+
+    async def test_cooldown_is_checked_before_browse_models_and_recovers_at_boundary(self):
+        await self.engine.start()
+        self.store.reserve(self.client.uid, 'BV0987654321', '不重复的已有评论', self.now, 0, 12, 0, .88)
+        self.store.finish(self.client.uid, 'BV0987654321', 'sent', '1')
+        self.cfg.browse.autonomous_enabled = True
+        result = await self.engine.round()
+        self.assertIn('12:45:00', result)
+        self.assertIn('冷却中', result)
+        self.client.recommended.assert_not_awaited()
+        self.client.understand.assert_not_awaited()
+        self.generate.assert_not_awaited()
+        self.assertFalse(self.engine.paused)
+        self.assertFalse(self.store.seen(self.client.uid, ITEM.bvid, 'publish'))
+        self.cfg.browse.autonomous_enabled = False
+        self.now += self.cfg.comment.min_interval_seconds
+        self.assertIn('已提交评论', await self.engine.round())
+        self.client.publish.assert_awaited_once()
+
+    async def test_manual_preview_can_run_during_comment_cooldown(self):
+        await self.engine.start()
+        self.store.reserve(self.client.uid, 'BV0987654321', '不重复的已有评论', self.now, 0, 12, 0, .88)
+        self.store.finish(self.client.uid, 'BV0987654321', 'sent', '1')
+        self.assertIn('预览评论', await self.engine.round(preview=True))
+        self.generate.assert_awaited_once()
+        self.client.publish.assert_not_awaited()
+
+    async def test_recent_followup_also_delays_new_video_comment(self):
+        await self.engine.start()
+        self.store.reserve(self.client.uid, 'BV0987654321', '已有根评论', self.now-7200, 0, 12, 0, .88)
+        self.store.finish(self.client.uid, 'BV0987654321', 'sent', '500')
+        message = IncomingReply('BV0987654321', 100, 500, 900, 500, '2', '对方', '继续讨论',
+                                '已有根评论', '已有根评论', self.now)
+        self.assertEqual(self.store.reserve_reply(self.client.uid, message, '跟进讨论的回复', self.now,
+                                                  0, 8, 900, 3, .88), 'reserved')
+        self.store.finish_reply(self.client.uid, 900, 'sent', '501')
+        self.assertIn('12:45:00', await self.engine.round())
+        self.generate.assert_not_awaited()
+        self.client.publish.assert_not_awaited()
+
+    async def test_concurrent_send_defers_video_preserves_details_and_retries_after_restart(self):
+        await self.engine.start()
+        async def concurrent_send(*args):
+            self.store.reserve(self.client.uid, 'BV0987654321', '其他工作进程刚提交的评论', self.now, 0, 12, 0, .88)
+            self.store.finish(self.client.uid, 'BV0987654321', 'sent', '1')
+            return decision()
+        self.generate.side_effect = concurrent_send
+        await self.engine.round()
+        row = self.store.page_records(self.client.uid, 'visits', ITEM.bvid, 1)['rows'][0]
+        detail = json.loads(row['detail'])
+        self.assertEqual(row['outcome'], 'deferred')
+        self.assertEqual(detail['title'], ITEM.title)
+        self.assertEqual(detail['comment'], json.loads(decision())['comment'])
+        self.assertEqual(detail['decision_reason'], json.loads(decision())['reason'])
+        self.assertIn('12:45:00', detail['reason'])
+        self.client.publish.assert_not_awaited()
+        self.assertFalse(self.engine.paused)
+        self.assertFalse(self.store.seen(self.client.uid, ITEM.bvid, 'publish'))
+        self.store.initialize()
+        self.now += self.cfg.comment.min_interval_seconds
+        self.client.recommended.return_value = []  # 推荐列表已变化，仍恢复保留的视频。
+        self.generate.side_effect = None
+        result = await self.engine.round()
+        self.assertIn('已提交评论', result)
+        self.assertEqual(self.generate.await_count, 2)  # 重新读取内容和判断，不能直接发送旧草稿。
+        self.client.publish.assert_awaited_once()
+        self.assertEqual(self.store.deferred_videos(self.client.uid), [])
+
+    async def test_legacy_cooldown_record_is_reconsidered_when_recommended_again(self):
+        await self.engine.start()
+        self.store.visit(self.client.uid, ITEM.bvid, 'publish', self.now-7200, 'blocked', 'cooldown')
+        self.assertIn('已提交评论', await self.engine.round())
+        self.client.publish.assert_awaited_once()
 
     async def test_reducing_maximum_shortens_saved_wait_and_enforces_new_model_range(self):
         self.cfg.browse.autonomous_enabled = True
@@ -505,6 +579,22 @@ class StoreTests(unittest.TestCase):
         self.store.initialize()
         self.assertEqual(self.store.stats("1", 0)["unresolved"], [ITEM.bvid])
         self.assertEqual(self.reserve(bvid="BV0987654321"), "unresolved")
+
+    def test_deferred_video_with_unknown_attempt_is_never_retried(self):
+        from dataclasses import asdict
+        self.store.visit('1', ITEM.bvid, 'publish', NOW, 'deferred', json.dumps({'video': asdict(ITEM)}))
+        self.assertEqual(self.store.deferred_videos('2'), [])
+        self.assertEqual(self.store.deferred_videos('1'), [ITEM])
+        self.assertEqual(self.reserve(), 'reserved')
+        self.store.finish('1', ITEM.bvid, 'unknown')
+        self.assertEqual(self.store.deferred_videos('1'), [])
+        self.assertTrue(self.store.seen('1', ITEM.bvid, 'publish'))
+
+    def test_structured_visit_details_remain_valid_beyond_1500_chars(self):
+        detail = json.dumps({'title': ITEM.title, 'comment': '测试' * 900}, ensure_ascii=False)
+        self.store.visit('1', ITEM.bvid, 'publish', NOW, 'deferred', detail)
+        row = self.store.page_records('1', 'visits', ITEM.bvid, 1)['rows'][0]
+        self.assertEqual(json.loads(row['detail'])['comment'], '测试' * 900)
 
     def test_atomic_reservation_prevents_concurrent_senders(self):
         from concurrent.futures import ThreadPoolExecutor

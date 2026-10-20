@@ -262,6 +262,14 @@
                 },
                 {
                   "type": "text",
+                  "label": "评论发送间隔",
+                  "value": {
+                    "source": "overview",
+                    "field": "comment_cooldown"
+                  }
+                },
+                {
+                  "type": "text",
                   "label": "意愿检查间隔",
                   "value": {
                     "source": "overview",

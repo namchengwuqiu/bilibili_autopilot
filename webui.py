@@ -14,6 +14,7 @@ OUTCOMES = {
     "invalid_decision": "判断校验失败", "skipped": "看过不评论 / 跳过", "would_comment": "拟发表评论",
     "sent": "已提交评论", "rejected": "平台拒绝", "unknown": "发送结果待核对",
     "pending": "发送中", "cancelled": "已取消", "acknowledged": "已人工核对", "blocked": "发送被拦截",
+    "deferred": "冷却等待，下次重新判断",
     "new": "等待判断", "would_reply": "拟跟进回复",
 }
 BLOCKS = {"daily_limit": "今日评论额度已满", "cooldown": "仍在评论间隔中", "duplicate_text": "评论完全重复",
@@ -69,7 +70,7 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
                   mode="实际发送" if kind == "attempts" else ("手动/自动预览" if row["mode"] == "preview" else "自主浏览"),
                   interest=detail.get("interest", ""), source=str(detail.get("source", "")),
                   comment=row["text"] if kind == "attempts" else str(detail.get("comment", "")),
-                  reason=str(detail.get("reason", BLOCKS.get(row["detail"], row["detail"]))),
+                  reason=BLOCKS.get(str(detail.get("reason", row["detail"])), str(detail.get("reason", row["detail"]))),
                   rpid=row["rpid"] if kind == "attempts" else "")
     result["summary"] = (result["comment"] or result["reason"])[:100]
     return result

@@ -130,6 +130,17 @@ class ReplyEngineTests(unittest.IsolatedAsyncioTestCase):
         self.now=NOW
         self.assertIn('已提交跟进回复',await self.engine.reply_round())
 
+    async def test_final_cooldown_check_preserves_message_for_retry(self):
+        original = self.store.reserve_reply
+        self.store.reserve_reply = lambda *args: 'cooldown'
+        await self.engine.reply_round()
+        self.assertEqual(len(self.store.pending_replies('1', 'publish', 0)), 1)
+        self.assertFalse(self.engine.paused)
+        self.store.reserve_reply = original
+        self.now += self.cfg.replies.interval_seconds
+        self.assertIn('已提交跟进回复', await self.engine.reply_round())
+        self.client.publish_reply.assert_awaited_once()
+
     async def test_pause_during_model_generation_prevents_send(self):
         async def paused(*args):
             await self.engine.pause('管理员手动暂停',kind='manual')

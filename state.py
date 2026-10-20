@@ -10,7 +10,7 @@ import hashlib
 import json
 import sqlite3
 
-from .models import IncomingReply, normalized
+from .models import IncomingReply, VideoItem, normalized
 
 
 class StateStore:
@@ -143,13 +143,23 @@ class StateStore:
         with self.connect() as db:
             db.execute("INSERT INTO visits VALUES (?, ?, ?, ?, ?, ?) "
                        "ON CONFLICT(uid,bvid,mode) DO UPDATE SET outcome=excluded.outcome, detail=excluded.detail",
-                       (uid, bvid, mode, ts, outcome, detail[:1500]))
+                       (uid, bvid, mode, ts, outcome, detail))
 
     def seen(self, uid: str, bvid: str, mode: str) -> bool:
         with self.connect() as db:
-            return bool(db.execute("SELECT 1 FROM visits WHERE uid=? AND bvid=? AND mode=?",
+            return bool(db.execute("SELECT 1 FROM visits WHERE uid=? AND bvid=? AND mode=? "
+                                   "AND outcome!='deferred' AND NOT (outcome='blocked' AND detail='cooldown')",
                                    (uid, bvid, mode)).fetchone() or
                         db.execute("SELECT 1 FROM attempts WHERE uid=? AND bvid=?", (uid, bvid)).fetchone())
+
+    def deferred_videos(self, uid: str) -> List[VideoItem]:
+        """只恢复明确未发送的冷却视频；已占用发送机会的视频永不重试。"""
+        with self.connect() as db:
+            rows = db.execute("SELECT v.detail FROM visits v WHERE v.uid=? AND v.mode='publish' "
+                              "AND v.outcome='deferred' AND NOT EXISTS "
+                              "(SELECT 1 FROM attempts a WHERE a.uid=v.uid AND a.bvid=v.bvid) "
+                              "ORDER BY v.ts LIMIT 3", (uid,)).fetchall()
+            return [VideoItem(**json.loads(row['detail'])['video']) for row in rows]
 
     def stats(self, uid: str, day_start: float) -> Dict[str, Any]:
         with self.connect() as db:
@@ -195,7 +205,7 @@ class StateStore:
         with self.connect() as db:
             rows = db.execute("SELECT i.payload FROM reply_inbox i WHERE i.uid=? AND i.received_at>=? "
                 "AND NOT EXISTS(SELECT 1 FROM reply_decisions d WHERE d.uid=i.uid AND d.source_rpid=i.source_rpid AND d.mode=? "
-                "AND d.outcome!='model_timeout') "
+                "AND d.outcome!='model_timeout' AND NOT (d.outcome='blocked' AND d.reason='cooldown')) "
                 "AND NOT EXISTS(SELECT 1 FROM reply_attempts a WHERE a.uid=i.uid AND a.source_rpid=i.source_rpid) "
                 "ORDER BY i.received_at,i.source_rpid LIMIT 3", (uid,since,mode))
             return [IncomingReply(**json.loads(r[0])) for r in rows]
