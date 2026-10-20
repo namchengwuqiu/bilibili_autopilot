@@ -27,6 +27,10 @@ python scripts/validate_release.py --tag v0.6.0 \
 
 ZIP 根目录直接包含插件文件，不套多层目录。脚本使用固定公共文件清单，因此不会将正在运行的本地配置或数据目录打包。
 
+## B 站依赖升级检查
+
+`client.py` 为确保签名准备完成后只发送一次评论请求，使用了 `bilibili-api-python` 的私有方法 `Api._prepare_request`。当前依赖固定为 `==17.4.2`。升级该依赖前，应检查私有方法签名、返回值和实际请求行为，并重新运行 `tests/test_client_plugin.py` 中的真实库签名、单次 POST、跟进回复楼层参数、签名期间暂停和未知结果不重试等测试；不要只修改依赖版本号后直接发布。
+
 ## 后续发版
 
 1. 同步更新 `_manifest.json` 和 `pyproject.toml` 的版本、README 顶部版本号，并在 CHANGELOG 顶部编写该版本说明。
