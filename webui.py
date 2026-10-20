@@ -1,0 +1,75 @@
+"""将插件的私有记录整理成管理页数据，不导出凭据或模型思考原文。"""
+
+from datetime import datetime
+from typing import Any, Dict
+from zoneinfo import ZoneInfo
+
+import json
+
+from .sharing import SHARE_OUTCOMES
+
+
+OUTCOMES = {
+    "reading": "正在读取", "read_error": "读取失败", "model_error": "模型调用失败", "model_timeout": "模型超时，等待下次检查",
+    "invalid_decision": "判断校验失败", "skipped": "看过不评论 / 跳过", "would_comment": "拟发表评论",
+    "sent": "已提交评论", "rejected": "平台拒绝", "unknown": "发送结果待核对",
+    "pending": "发送中", "cancelled": "已取消", "acknowledged": "已人工核对", "blocked": "发送被拦截",
+    "new": "等待判断", "would_reply": "拟跟进回复",
+}
+BLOCKS = {"daily_limit": "今日评论额度已满", "cooldown": "仍在评论间隔中", "duplicate_text": "评论完全重复",
+          "similar_text": "评论过于相似", "duplicate_video": "该视频已尝试评论", "paused": "已暂停",
+          "unresolved": "存在待核对的发送结果"}
+BLOCKS.update(thread_limit="该讨论已达到跟进上限",duplicate_reply="该消息已处理",
+              untracked_thread="根评论不在本地已发送记录中",untracked_target="被回复的评论不在本地记录中")
+
+
+def local_time(timestamp: float, timezone: str) -> str:
+    return datetime.fromtimestamp(timestamp, ZoneInfo(timezone)).strftime("%m-%d %H:%M:%S")
+
+
+def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
+    result = {"time": local_time(row.get("ts",row.get("received_at")), timezone), "title": "", "bvid": "", "url": "",
+              "outcome": "", "mode": "", "interest": "", "comment": "", "reason": "",
+              "source": "", "rpid": "", "summary": "", "next_time": ""}
+    result.update(sender='',incoming='',target='',source_rpid='')
+    if kind == "shares":
+        result.update(title=row['title'],bvid=row['bvid'],url='https://www.bilibili.com/video/'+row['bvid'],
+                      outcome=SHARE_OUTCOMES.get(row['status'],row['status']),mode='评论后群分享',
+                      reason=f"QQ 群 {row['group_id']}；{row['detail']}",rpid=row['message_id'])
+        result['summary'] = result['reason'][:100]
+        return result
+    if kind in {'replies','reply_attempts'}:
+        message = json.loads(row['payload'])
+        decision = row['decision']
+        outcome = row.get('status') or decision.get('outcome','new')
+        result.update(time=local_time(row.get('ts',row.get('received_at')),timezone),
+            title='跟进讨论',bvid=row['bvid'],url='https://www.bilibili.com/video/'+row['bvid'],
+            sender=message.get('sender_name',''),incoming=message.get('text',''),target=message.get('target_text','')[:500],
+            source_rpid=str(row['source_rpid']),outcome=OUTCOMES.get(outcome,outcome),
+            mode='实际发送' if kind=='reply_attempts' else '预览' if decision.get('mode')=='preview' else '自动判断',
+            comment=row['text'] if kind=='reply_attempts' else decision.get('text',''),
+            reason=BLOCKS.get(decision.get('reason',''),decision.get('reason','')),rpid=row.get('rpid',''))
+        result['summary']=(result['comment'] or result['reason'])[:100]
+        return result
+    if kind == "decisions":
+        result.update(title="自主浏览意愿", outcome="去浏览" if row["should_browse"] else "暂时不刷",
+                      reason=row["reason"], summary=row["reason"],
+                      next_time=local_time(row["next_check_at"], timezone))
+        return result
+    try:
+        detail = json.loads(row["detail"])
+    except (ValueError, TypeError):
+        detail = {}
+    if not isinstance(detail, dict):
+        detail = {}
+    outcome = row["status"] if kind == "attempts" else row["outcome"]
+    bvid = row["bvid"]
+    result.update(bvid=bvid, url="https://www.bilibili.com/video/" + bvid,
+                  title=str(detail.get("title", bvid)), outcome=OUTCOMES.get(outcome, outcome),
+                  mode="实际发送" if kind == "attempts" else ("手动/自动预览" if row["mode"] == "preview" else "自主浏览"),
+                  interest=detail.get("interest", ""), source=str(detail.get("source", "")),
+                  comment=row["text"] if kind == "attempts" else str(detail.get("comment", "")),
+                  reason=str(detail.get("reason", BLOCKS.get(row["detail"], row["detail"]))),
+                  rpid=row["rpid"] if kind == "attempts" else "")
+    result["summary"] = (result["comment"] or result["reason"])[:100]
+    return result

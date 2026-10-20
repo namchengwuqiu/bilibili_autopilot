@@ -1,0 +1,734 @@
+{
+  "schema_version": 2,
+  "required_capabilities": [
+    "declarative_basic"
+  ],
+  "workspace_title": "B站自主浏览",
+  "pages": [
+    {
+      "id": "manage",
+      "title": "B站自主浏览管理",
+      "description": "查看麦麦的浏览意愿、视频记录和评论结果，也可直接执行管理指令。页面每 5 秒刷新。",
+      "placement": "sidebar",
+      "icon": "chart",
+      "mode": "declarative",
+      "poll_interval_seconds": 5,
+      "queries": {
+        "overview": {
+          "api": "autopilot_overview",
+          "parameters": {}
+        },
+        "records": {
+          "api": "autopilot_records",
+          "parameters": {
+            "kind": {
+              "type": "string",
+              "choices": [
+                "visits",
+                "attempts",
+                "decisions",
+                "replies",
+                "reply_attempts",
+                "shares"
+              ]
+            },
+            "search": {
+              "type": "string",
+              "max_length": 200
+            },
+            "page": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      },
+      "actions": {
+        "start": {
+          "api": "autopilot_command",
+          "parameters": {
+            "command": {
+              "type": "string",
+              "required": true,
+              "choices": [
+                "/bili_auto start"
+              ]
+            }
+          },
+          "arguments": {
+            "command": {
+              "source": "overview",
+              "field": "commands.start"
+            }
+          }
+        },
+        "pause": {
+          "api": "autopilot_command",
+          "parameters": {
+            "command": {
+              "type": "string",
+              "required": true,
+              "choices": [
+                "/bili_auto pause"
+              ]
+            }
+          },
+          "arguments": {
+            "command": {
+              "source": "overview",
+              "field": "commands.pause"
+            }
+          }
+        },
+        "preview": {
+          "api": "autopilot_command",
+          "parameters": {
+            "command": {
+              "type": "string",
+              "required": true,
+              "choices": [
+                "/bili_auto preview"
+              ]
+            }
+          },
+          "arguments": {
+            "command": {
+              "source": "overview",
+              "field": "commands.preview"
+            }
+          }
+        },
+        "login": {
+          "api": "autopilot_command",
+          "parameters": {
+            "command": {
+              "type": "string",
+              "required": true,
+              "choices": [
+                "/bili_auto login"
+              ]
+            }
+          },
+          "arguments": {
+            "command": {
+              "source": "overview",
+              "field": "commands.login"
+            }
+          }
+        },
+        "status": {
+          "api": "autopilot_command",
+          "parameters": {
+            "command": {
+              "type": "string",
+              "required": true,
+              "choices": [
+                "/bili_auto status"
+              ]
+            }
+          },
+          "arguments": {
+            "command": {
+              "source": "overview",
+              "field": "commands.status"
+            }
+          }
+        },
+        "history": {
+          "api": "autopilot_command",
+          "parameters": {
+            "command": {
+              "type": "string",
+              "required": true,
+              "choices": [
+                "/bili_auto history"
+              ]
+            }
+          },
+          "arguments": {
+            "command": {
+              "source": "overview",
+              "field": "commands.history"
+            }
+          }
+        },
+        "execute": {
+          "api": "autopilot_command",
+          "parameters": {
+            "command": {
+              "type": "string",
+              "required": true,
+              "max_length": 120
+            }
+          }
+        },
+        "logout": {
+          "api": "autopilot_logout",
+          "parameters": {},
+          "confirmation": "退出当前 B 站账号并暂停？浏览与评论历史会保留。"
+        },
+        "ack": {
+          "api": "autopilot_ack",
+          "parameters": {
+            "bvid": {
+              "type": "string",
+              "required": true,
+              "max_length": 12
+            }
+          },
+          "confirmation": "请先在 B 站核对该视频下评论或跟进回复的实际发送结果。确认已核对后解除阻塞，不会重新发送。"
+        },
+        "replies": {
+          "api": "autopilot_command",
+          "parameters": {
+            "command": {
+              "type": "string",
+              "required": true,
+              "choices": [
+                "/bili_auto replies"
+              ]
+            }
+          },
+          "arguments": {
+            "command": {
+              "source": "overview",
+              "field": "commands.replies"
+            }
+          }
+        }
+      },
+      "content": [
+        {
+          "type": "grid",
+          "columns": 4,
+          "children": [
+            {
+              "type": "stat",
+              "label": "运行状态",
+              "value": {
+                "source": "overview",
+                "field": "state"
+              }
+            },
+            {
+              "type": "stat",
+              "label": "今日分析 / 上限",
+              "value": {
+                "source": "overview",
+                "field": "views"
+              }
+            },
+            {
+              "type": "stat",
+              "label": "今日发送尝试 / 上限",
+              "value": {
+                "source": "overview",
+                "field": "attempts"
+              }
+            },
+            {
+              "type": "stat",
+              "label": "下次自主检查",
+              "value": {
+                "source": "overview",
+                "field": "next_check"
+              }
+            }
+          ]
+        },
+        {
+          "type": "grid",
+          "columns": 2,
+          "children": [
+            {
+              "type": "card",
+              "label": "账号与自主决定",
+              "children": [
+                {
+                  "type": "text",
+                  "label": "当前账号",
+                  "value": {
+                    "source": "overview",
+                    "field": "account"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "评论模式",
+                  "value": {
+                    "source": "overview",
+                    "field": "mode"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "意愿检查间隔",
+                  "value": {
+                    "source": "overview",
+                    "field": "check_range"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "最近自主决定",
+                  "value": {
+                    "source": "overview",
+                    "field": "choice"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "暂停原因",
+                  "value": {
+                    "source": "overview",
+                    "field": "pause_reason"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "待核对的评论 BV 号",
+                  "value": {
+                    "source": "overview",
+                    "field": "unresolved"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "今日跟进回复发送",
+                  "value": {
+                    "source": "overview",
+                    "field": "replies"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "今日收到回复分析",
+                  "value": {
+                    "source": "overview",
+                    "field": "reply_analyses"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "下次检查收到的回复",
+                  "value": {
+                    "source": "overview",
+                    "field": "reply_next_check"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "card",
+              "label": "运行控制",
+              "children": [
+                {
+                  "type": "grid",
+                  "columns": 3,
+                  "children": [
+                    {
+                      "type": "button",
+                      "label": "恢复运行",
+                      "action": "start",
+                      "variant": "primary",
+                      "disabled_when": {
+                        "reference": {
+                          "source": "overview",
+                          "field": "busy"
+                        },
+                        "operator": "truthy"
+                      },
+                      "disabled_reason": "正在处理任务，请等待完成"
+                    },
+                    {
+                      "type": "button",
+                      "label": "暂停",
+                      "action": "pause",
+                      "variant": "primary"
+                    },
+                    {
+                      "type": "button",
+                      "label": "预览一轮",
+                      "action": "preview",
+                      "variant": "primary",
+                      "disabled_when": {
+                        "reference": {
+                          "source": "overview",
+                          "field": "busy"
+                        },
+                        "operator": "truthy"
+                      },
+                      "disabled_reason": "正在处理任务，请等待完成"
+                    }
+                  ]
+                },
+                {
+                  "type": "grid",
+                  "columns": 3,
+                  "children": [
+                    {
+                      "type": "button",
+                      "label": "扫码登录",
+                      "action": "login",
+                      "variant": "primary",
+                      "disabled_when": {
+                        "reference": {
+                          "source": "overview",
+                          "field": "busy"
+                        },
+                        "operator": "truthy"
+                      },
+                      "disabled_reason": "正在处理任务，请等待完成"
+                    },
+                    {
+                      "type": "button",
+                      "label": "查看状态",
+                      "action": "status",
+                      "variant": "primary"
+                    },
+                    {
+                      "type": "button",
+                      "label": "最近记录",
+                      "action": "history",
+                      "variant": "primary"
+                    }
+                  ]
+                },
+                {
+                  "type": "button",
+                  "label": "检查回复（只预览）",
+                  "action": "replies",
+                  "variant": "muted",
+                  "disabled_when": {
+                    "reference": {
+                      "source": "overview",
+                      "field": "busy"
+                    },
+                    "operator": "truthy"
+                  },
+                  "disabled_reason": "正在处理任务，请等待完成"
+                },
+                {
+                  "type": "text",
+                  "label": "当前任务",
+                  "value": {
+                    "source": "overview",
+                    "field": "job"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "操作状态",
+                  "value": {
+                    "source": "overview",
+                    "field": "operation_state"
+                  }
+                },
+                {
+                  "type": "text",
+                  "value": "恢复运行后仍由麦麦决定这次刷不刷；预览一轮始终不发评论。登录和预览在后台进行，结果会自动更新。"
+                },
+                {
+                  "type": "text",
+                  "label": "最近收到回复检查结果",
+                  "value": {
+                    "source": "overview",
+                    "field": "reply_result"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "指令与执行结果",
+          "children": [
+            {
+              "type": "input",
+              "label": "输入指令，例如 /bili_auto preview",
+              "name": "command",
+              "value": "/bili_auto status"
+            },
+            {
+              "type": "button",
+              "label": "执行指令",
+              "action": "execute",
+              "variant": "primary"
+            },
+            {
+              "type": "text",
+              "label": "最近指令结果",
+              "format": "log",
+              "value": {
+                "source": "overview",
+                "field": "operation"
+              }
+            },
+            {
+              "type": "collapsible",
+              "label": "最近一轮浏览结果",
+              "children": [
+                {
+                  "type": "text",
+                  "label": "结果",
+                  "value": {
+                    "source": "overview",
+                    "field": "last_round"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "扫码登录",
+          "when": {
+            "reference": {
+              "source": "overview",
+              "field": "qr"
+            },
+            "operator": "not_empty"
+          },
+          "children": [
+            {
+              "type": "text",
+              "value": "请用 B 站客户端扫描二维码并确认。二维码有效期约 3 分钟，完成或失败后自动隐藏。"
+            },
+            {
+              "type": "image",
+              "label": "B 站登录二维码",
+              "value": {
+                "source": "overview",
+                "field": "qr"
+              }
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "评论后群分享",
+          "children": [
+            {
+              "type": "text",
+              "label": "分享目标群",
+              "value": {
+                "source": "overview",
+                "field": "share_targets"
+              }
+            },
+            {
+              "type": "text",
+              "label": "最近群分享结果",
+              "value": {
+                "source": "overview",
+                "field": "share_result"
+              }
+            },
+            {
+              "type": "text",
+              "value": "仅实际提交成功的视频一级评论触发，发送视频标题和链接。默认群号留空；在插件配置中填写 QQ 群号后启用。预览、跳过、跟进回复和结果待核对的评论不会分享；同一视频对同一群只尝试一次。"
+            }
+          ]
+        },
+        {
+          "type": "card",
+          "label": "数据记录",
+          "children": [
+            {
+              "type": "grid",
+              "columns": 2,
+              "children": [
+                {
+                  "type": "select",
+                  "name": "kind",
+                  "label": "记录类型",
+                  "value": "visits",
+                  "options": [
+                    {
+                      "label": "视频浏览与评论判断",
+                      "value": "visits"
+                    },
+                    {
+                      "label": "实际评论发送记录",
+                      "value": "attempts"
+                    },
+                    {
+                      "label": "自主浏览决定",
+                      "value": "decisions"
+                    },
+                    {
+                      "label": "收到的回复与判断",
+                      "value": "replies"
+                    },
+                    {
+                      "label": "跟进回复发送记录",
+                      "value": "reply_attempts"
+                    },
+                    {
+                      "label": "评论后群分享记录",
+                      "value": "shares"
+                    }
+                  ]
+                },
+                {
+                  "type": "input",
+                  "name": "search",
+                  "label": "搜索视频标题、BV 号、评论或理由",
+                  "value": ""
+                }
+              ]
+            },
+            {
+              "type": "table",
+              "value": {
+                "source": "records",
+                "field": "rows"
+              },
+              "columns": [
+                {
+                  "field": "time",
+                  "label": "时间"
+                },
+                {
+                  "field": "title",
+                  "label": "视频 / 决定"
+                },
+                {
+                  "field": "bvid",
+                  "label": "BV 号"
+                },
+                {
+                  "field": "outcome",
+                  "label": "结果"
+                },
+                {
+                  "field": "interest",
+                  "label": "兴趣分"
+                },
+                {
+                  "field": "comment",
+                  "label": "拟写 / 已提交评论"
+                },
+                {
+                  "field": "reason",
+                  "label": "判断理由"
+                },
+                {
+                  "field": "next_time",
+                  "label": "原定下次考虑时间"
+                },
+                {
+                  "field": "rpid",
+                  "label": "评论 / 群消息 ID"
+                }
+              ],
+              "when": {
+                "reference": {
+                  "source": "records",
+                  "field": "is_reply"
+                },
+                "operator": "equals",
+                "expected": false
+              }
+            },
+            {
+              "type": "table",
+              "value": {
+                "source": "records",
+                "field": "rows"
+              },
+              "when": {
+                "reference": {
+                  "source": "records",
+                  "field": "is_reply"
+                },
+                "operator": "equals",
+                "expected": true
+              },
+              "columns": [
+                {
+                  "field": "time",
+                  "label": "时间"
+                },
+                {
+                  "field": "bvid",
+                  "label": "BV 号"
+                },
+                {
+                  "field": "sender",
+                  "label": "对方昵称"
+                },
+                {
+                  "field": "incoming",
+                  "label": "收到的回复"
+                },
+                {
+                  "field": "target",
+                  "label": "对方回复的麦麦原话"
+                },
+                {
+                  "field": "outcome",
+                  "label": "处理结果"
+                },
+                {
+                  "field": "comment",
+                  "label": "拟写 / 已提交跟进"
+                },
+                {
+                  "field": "reason",
+                  "label": "判断理由"
+                },
+                {
+                  "field": "rpid",
+                  "label": "跟进评论 ID"
+                }
+              ]
+            },
+            {
+              "type": "pagination",
+              "name": "page",
+              "value": {
+                "source": "records",
+                "field": "pagination"
+              }
+            },
+            {
+              "type": "text",
+              "value": "按当前登录账号显示，每页 20 条。拟写评论不代表已发布，实际发送结果请切换到“实际评论发送记录”。 顶部检查时间按当前间隔配置计算，历史表保留当时原定的时间。"
+            }
+          ]
+        },
+        {
+          "type": "collapsible",
+          "label": "核对发送结果与退出账号",
+          "children": [
+            {
+              "type": "text",
+              "value": "只有出现“发送结果待核对”时，才需要在 B 站检查评论后填写 BV 号并确认。"
+            },
+            {
+              "type": "input",
+              "name": "bvid",
+              "label": "已核对的完整 BV 号",
+              "value": ""
+            },
+            {
+              "type": "button",
+              "label": "确认已核对该视频",
+              "action": "ack",
+              "variant": "muted"
+            },
+            {
+              "type": "button",
+              "label": "退出 B 站登录",
+              "action": "logout",
+              "variant": "danger"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

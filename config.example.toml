@@ -1,0 +1,49 @@
+# Public defaults. Never copy local credentials, administrator accounts or group IDs here.
+[plugin]
+enabled = true
+config_version = "0.1.0"
+admin_users = []
+
+[browse]
+auto_start = true
+autonomous_enabled = true
+explore_more = false
+interval_seconds = 600
+max_check_minutes = 20
+videos_per_round = 3
+videos_per_day = 180
+max_duration_seconds = 1200
+interests = ""
+blocked_keywords = []
+blocked_up_uids = []
+active_start_hour = 9
+active_end_hour = 23
+timezone = "Asia/Shanghai"
+
+[comment]
+publish_enabled = false
+per_day = 12
+min_interval_seconds = 2700
+max_chars = 160
+min_interest = 0.75
+similarity_threshold = 0.88
+
+[model]
+task = "replyer"
+candidates = []
+timeout_seconds = 90
+extra_style = ""
+content_max_chars = 12000
+
+[replies]
+enabled = true
+interval_seconds = 600
+per_day = 8
+analyses_per_day = 20
+per_thread = 3
+min_interval_seconds = 900
+max_age_hours = 72
+
+[share]
+qq_group_ids = []
+
