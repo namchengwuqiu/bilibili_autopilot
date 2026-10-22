@@ -484,6 +484,48 @@ class SharePolishTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.plugin._generate.await_count, 2)
 
+    async def test_rejected_draft_is_rewritten_once_with_specific_feedback_and_reviewed(self):
+        self.plugin.config.share.polish_enabled = False
+        rejection = {"supported": False, "kind": "factual", "reason": "摘录未提供祠堂地点"}
+        self.plugin._generate = AsyncMock(side_effect=[
+            json.dumps({"text": "跑去祠堂问公司能不能活三年"}), json.dumps(rejection),
+            json.dumps({"text": "这问题压力有点大"}), support(),
+        ])
+        trace = {}
+        result = await self.plugin._share_steps(ITEM, self.context, self.plugin.config.model_copy(deep=True), trace=trace)
+        self.assertEqual(result, "这问题压力有点大")
+        self.assertEqual(self.plugin._generate.await_count, 4)
+        retry_context = json.loads(self.plugin._generate.await_args_list[2].args[0][1]["content"])
+        self.assertEqual(retry_context["validation_feedback"]["reason"], rejection["reason"])
+        self.assertEqual(retry_context["content_evidence"], self.context["content_evidence"])
+        review_context = json.loads(self.plugin._generate.await_args_list[3].args[0][1]["content"])
+        self.assertEqual(review_context["body"], result)
+        self.assertEqual(len(trace["draft_attempts"]), 2)
+        self.assertFalse(trace["draft_attempts"][0]["review"]["supported"])
+        self.assertNotIn("validation_feedback", self.context)
+
+    async def test_second_draft_rejection_stops_with_public_reason(self):
+        rejection = json.dumps({"supported": False, "kind": "factual", "reason": "摘录缺少地点依据"})
+        self.plugin._generate = AsyncMock(side_effect=[
+            json.dumps({"text": "祠堂压力大"}), rejection,
+            json.dumps({"text": "祖宗压力大"}), rejection,
+        ])
+        with self.assertRaisesRegex(DecisionValidationError, "摘录缺少地点依据"):
+            await self.plugin._share_steps(ITEM, self.context, self.plugin.config.model_copy(deep=True))
+        self.assertEqual(self.plugin._generate.await_count, 4)
+
+    async def test_invalid_draft_format_can_be_repaired_but_timeout_is_not_retried(self):
+        self.plugin.config.share.polish_enabled = False
+        self.plugin._generate = AsyncMock(side_effect=["not json", json.dumps({"text": self.draft}), support()])
+        self.assertEqual(
+            await self.plugin._share_steps(ITEM, self.context, self.plugin.config.model_copy(deep=True)), self.draft
+        )
+        self.assertEqual(self.plugin._generate.await_count, 3)
+        self.plugin._generate = AsyncMock(side_effect=[json.dumps({"text": self.draft}), asyncio.TimeoutError()])
+        with self.assertRaises(asyncio.TimeoutError):
+            await self.plugin._share_steps(ITEM, self.context, self.plugin.config.model_copy(deep=True))
+        self.assertEqual(self.plugin._generate.await_count, 2)
+
     async def test_pause_and_config_change_during_polish_cancel_actual_share(self):
         for pause in [True, False]:
             with TemporaryDirectory() as folder:

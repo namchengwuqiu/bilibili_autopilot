@@ -2,7 +2,7 @@
 
 <p align="center"><img src="icon.png" width="128" height="128" alt="B站自主浏览与评论图标"></p>
 
-> **Version:** 0.7.0 · MaiBot ≥ 1.3.10 · Python ≥ 3.10 · SDK ≥ 2.12.0
+> **Version:** 0.7.1 · MaiBot ≥ 1.3.10 · Python ≥ 3.10 · SDK ≥ 2.12.0
 
 麦麦独立插件 `local.bilibili-autopilot`，由 [sakura桜花](https://github.com/namchengwuqiu) 维护。登录你指定的账号后，默认自动进入自主模式：麦麦先结合人设、兴趣、时间和最近的浏览反馈决定这次刷不刷 B 站，再结合视频内容决定要不要发表评论。
 
@@ -184,3 +184,7 @@ docker compose exec -T -w /MaiMBot/plugins/local_bilibili_autopilot core python 
 证据缓存按账号和视频保存最多500字引用及对应时间片段，默认7天到期，周期清理；不存完整字幕文件、画面或音频。发送记录中的最小引用片段沿用既有历史留存，用于核对历史评论。模型调用耗时与Host可返回的token用量只写入本插件私有数据库，管理页显示汇总。
 
 文案预览工具位于 `scripts/preview_shares.py`，通过模型适配器运行 `docs/share_samples.json` 的20条五类题材样本和3条重复样本，对照v0.6.3原提示、仅改提示、增加润色。它不读取账号凭据或运行数据库，也不发送B站评论和群消息。真实群分享前应由用户或指定评审者检查自然度、人设、重复与事实依据。
+
+## v0.7.1 群分享修复
+
+分享只将 `content_evidence` 摘录作为视频事实依据，避免沿用原评论或标题超出摘录的背景。草稿格式或依据校验失败时，最多带具体原因重写一次并重新复核，仍受原分享总时限限制；再次失败则跳过，记录显示校验类别与原因。历史分享失败或结果未知不会自动补发。

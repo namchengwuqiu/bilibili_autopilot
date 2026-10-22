@@ -205,12 +205,6 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
                 trace.update(values)
 
         persona = await self._persona()
-        prompt = share_prompt(item, context, persona=persona, extra_style=cfg.model.extra_style)
-        raw = await self._generate(prompt, cfg)
-        record(draft_raw=raw, result_mode="skipped")
-        draft = parse_share_text(raw)
-        record(draft=draft)
-
         async def verify(text: str, original: str = "") -> None:
             raw = await asyncio.wait_for(
                 self._generate(support_prompt(text, context.get("content_evidence", {}), draft=original), cfg),
@@ -219,9 +213,35 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             review = parse_support(raw)
             record(**{"polish_review" if original else "draft_review": review})
             if not review["supported"]:
-                raise DecisionValidationError("unsupported_share", "群分享正文缺少依据或新增了草稿之外的事实")
+                raise DecisionValidationError("unsupported_share", review["reason"])
 
-        await verify(draft)
+        draft_context = dict(context)
+        draft_attempts = []
+        for attempt in range(2):
+            prompt = share_prompt(item, draft_context, persona=persona, extra_style=cfg.model.extra_style)
+            raw = await self._generate(prompt, cfg)
+            record(draft_raw=raw, result_mode="skipped")
+            current_attempt: Dict[str, Any] = {"raw": raw}
+            draft_attempts.append(current_attempt)
+            record(draft_attempts=draft_attempts)
+            try:
+                draft = parse_share_text(raw)
+                record(draft=draft)
+                current_attempt["draft"] = draft
+                await verify(draft)
+            except ValueError as exc:
+                feedback = {"code": getattr(exc, "code", "share_format"), "reason": str(exc)[:300]}
+                current_attempt["validation_error"] = feedback
+                if trace is not None and "draft_review" in trace:
+                    current_attempt["review"] = trace.pop("draft_review")
+                if attempt == 1:
+                    raise DecisionValidationError(feedback["code"], feedback["reason"]) from None
+                # 只修正文案一次，仍使用原内容依据并重新复核；不重试消息发送。
+                draft_context["validation_feedback"] = feedback
+                continue
+            if trace is not None:
+                current_attempt["review"] = trace.get("draft_review")
+            break
         if not cfg.share.polish_enabled:
             record(result_mode="disabled")
             return draft

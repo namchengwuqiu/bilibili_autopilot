@@ -6,7 +6,7 @@ import asyncio
 import time
 
 from .config import AutopilotConfig
-from .models import VideoItem
+from .models import DecisionValidationError, VideoItem
 from .state import StateStore
 
 
@@ -86,6 +86,12 @@ class VideoSharer:
             except asyncio.CancelledError:
                 # pending 在重载时转为 unknown，避免中断后重复向群里发消息。
                 raise
+            except DecisionValidationError as exc:
+                status = "unknown" if post_started else "failed"
+                detail = (
+                    "群消息可能已发送，结果待核对；不会自动重发" if post_started else
+                    f"{phase}校验失败 [{exc.code}]：{str(exc)[:300]}；未发送，不会自动重发"
+                )
             except Exception as exc:
                 status = "unknown" if post_started else "failed"
                 detail = ("群消息可能已发送，结果待核对" if post_started else f"{phase}失败，未发送") + f"（{type(exc).__name__}）；不会自动重发"

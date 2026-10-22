@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "id": "local.bilibili-autopilot",
   "name": "B站自主浏览与评论",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "自主决定何时浏览 B 站和发表评论，检查别人对麦麦评论的回复并决定是否接话，支持预览、管理页、限额和持久化去重。",
   "author": {
     "name": "sakura桜花",

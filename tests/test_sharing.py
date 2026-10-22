@@ -7,7 +7,7 @@ import json
 import unittest
 
 from local_bilibili_autopilot.config import AutopilotConfig
-from local_bilibili_autopilot.models import ModelTimeoutError, VideoItem, parse_share_text, share_prompt
+from local_bilibili_autopilot.models import DecisionValidationError, ModelTimeoutError, VideoItem, parse_share_text, share_prompt
 from local_bilibili_autopilot.sharing import VideoSharer
 from local_bilibili_autopilot.state import StateStore
 from local_bilibili_autopilot.webui import record_row
@@ -137,6 +137,17 @@ class SharingTests(unittest.IsolatedAsyncioTestCase):
         self.compose.side_effect = compose
         self.assertIn("已取消", await self.sharer.share("1", ITEM))
         self.send.text.assert_not_awaited()
+
+    async def test_validation_failure_displays_reason_without_sending_or_retrying(self):
+        self.comment_sent()
+        self.compose.side_effect = DecisionValidationError("unsupported_share", "摘录未提供祠堂地点")
+        result = await self.sharer.share("1", ITEM)
+        self.assertIn("[unsupported_share]", result)
+        self.assertIn("摘录未提供祠堂地点", result)
+        await self.sharer.share("1", ITEM)
+        self.compose.assert_awaited_once()
+        self.send.text.assert_not_awaited()
+        self.assertEqual(self.store.latest_share("1")["status"], "failed")
 
     async def test_configuration_change_during_composition_cancels_send(self):
         self.comment_sent()
