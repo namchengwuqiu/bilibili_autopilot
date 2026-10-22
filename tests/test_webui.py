@@ -35,7 +35,7 @@ class WebUITests(unittest.IsolatedAsyncioTestCase):
         self.plugin.client = self.client
         self.plugin.engine = Autopilot(self.client, StateStore(Path(self.temp.name) / "state.sqlite3"),
                                         lambda: self.plugin.config, AsyncMock(return_value=DECISION),
-                                        AsyncMock(return_value="喜欢游戏与音乐"))
+                                        AsyncMock(return_value="喜欢游戏与音乐"),review=AsyncMock(return_value=json.dumps({"supported":True,"kind":"factual","reason":"模拟复核通过"})))
         await self.plugin.engine.initialize()
         self.plugin._ctx = SimpleNamespace(send=SimpleNamespace(text=AsyncMock(), image=AsyncMock()),
                                             logger=SimpleNamespace(warning=lambda *a: None))

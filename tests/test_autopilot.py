@@ -50,7 +50,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.generate = AsyncMock(return_value=decision())
         self.persona = AsyncMock(return_value="好奇、喜欢海洋生物")
         self.store = StateStore(Path(self.temp.name) / "state.sqlite3")
-        self.engine = Autopilot(self.client, self.store, lambda: self.cfg, self.generate, self.persona, lambda: self.now)
+        self.engine = Autopilot(self.client, self.store, lambda: self.cfg, self.generate, self.persona, lambda: self.now, review=AsyncMock(return_value=json.dumps({"supported":True,"kind":"factual","reason":"模拟复核通过"})))
         await self.engine.initialize()
 
     async def test_initial_state_does_not_browse_or_publish(self):
@@ -108,7 +108,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.start()
         await self.engine.round()
         self.now += 7200
-        restored = Autopilot(self.client, self.store, lambda: self.cfg, self.generate, self.persona, lambda: self.now)
+        restored = Autopilot(self.client, self.store, lambda: self.cfg, self.generate, self.persona, lambda: self.now, review=AsyncMock(return_value=json.dumps({"supported":True,"kind":"factual","reason":"模拟复核通过"})))
         await restored.initialize()
         await restored.round()
         self.client.publish.assert_awaited_once()
@@ -413,6 +413,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.deferred_videos(self.client.uid), [])
 
     async def test_cooldown_reads_full_round_and_skips_deferred_videos_on_later_rounds(self):
+        self.cfg.browse.max_per_up = 3  # 此例专门验证冷却队列；同 UP 的默认限制另有回归覆盖。
         await self.engine.start()
         self.store.reserve(self.client.uid, 'BV0987654321', '不重复的已有评论', self.now, 0, 12, 0, .88)
         self.store.finish(self.client.uid, 'BV0987654321', 'sent', '1')

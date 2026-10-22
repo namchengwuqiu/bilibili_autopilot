@@ -7,21 +7,21 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`；当前发布版本：`0.6.3`。配置格式版本 `plugin.config_version=0.1.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本：`0.6.0`；当前版本：`0.7.0`。配置格式版本 `plugin.config_version=0.2.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
 1. 在公开仓库默认分支的根目录提交源码和资源，确保 `_manifest.json`、`plugin.py`、`README.md`、`LICENSE` 都位于根目录。
-2. 运行 `python scripts/validate_release.py --tag v0.6.3`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
+2. 运行 `python scripts/validate_release.py --tag v0.7.0`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
 3. 确认源码仓库不包含 `config.toml`、`config_back/`、登录凭据、二维码、数据库及运行数据。默认示例仅使用 `config.example.toml`。
-4. 创建并推送 `v0.6.3` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
+4. 创建并推送 `v0.7.0` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
 5. 确认 Release 已公开发布，随后按 [市场登记文案](MARKETPLACE_SUBMISSION.md) 在插件中心创建新增插件 Issue。
 6. 等待市场验证、同步及审核收录。只有仓库代码或 Tag 不满足首次登记要求，草稿 Release 也不满足要求。
 
 手动生成用于检查的发布附件：
 
 ```sh
-python scripts/validate_release.py --tag v0.6.3 \
+python scripts/validate_release.py --tag v0.7.0 \
   --archive dist/bilibili-autopilot.zip --notes dist/release-notes.md
 ```
 
@@ -50,3 +50,12 @@ ZIP 根目录直接包含插件文件，不套多层目录。脚本使用固定�
 - 检查管理页是否显示首次时间、更新时间、发送尝试时间及重查状态。冷却期间仍可分析新视频；临时失败按至少 10、20 分钟的间隔最多重查两次，重启不重置次数。
 - 横向滚动修复位于 MaiBot 主程序 WebUI（[PR #2208](https://github.com/Mai-with-u/MaiBot/pull/2208)，目前待合并）；本插件发布包不包含宿主前端。部署包含该修复的 WebUI 完整构建产物后再刷新页面，检查右侧“失败重查状态”等字段可以通过左右滚动到达。不要只覆盖同名、带长期缓存的单个 JS 或 CSS 文件。
 - 自动化验证仅使用模拟平台响应和临时数据库，不访问真实账号或发送评论、回复、群消息。GitHub Actions 在 Python 3.10、3.13 上执行完整测试，发布任务再次运行测试后创建 Release。
+
+
+## 0.7.0 升级与验证
+
+等待恢复、网络退避、正文复核、模型选片、字幕覆盖及分享润色详见 [优化与运维说明](OPTIMIZATION.md)。旧配置缺失字段使用默认值，保留管理员、群号、发布开关与账号数据；本版配置默认格式版本为0.2.0。
+
+先在管理页暂停并等当前发送结束，使用SQLite backup备份状态库，再替换公共文件。宿主会监听Python源码与清单变化并重新启动插件Supervisor，因此本地同步会触发加载；不要分批留下半套版本。加载后保持暂停，先查看文案对照预览并进行人工评审，再恢复。回滚只替换代码并保留最新发送记录，避免旧数据库丢失去重信息。
+
+当前仓库中的版本说明和发布命令仅为准备资料，是否已公开发布须以实际Release为准。

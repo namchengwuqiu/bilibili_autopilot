@@ -16,6 +16,10 @@ FILES = (
     "models.py", "sharing.py", "state.py", "webui.py", "webui.json", "icon.png",
     "README.md", "CHANGELOG.md", "LICENSE", "requirements.txt", "pyproject.toml",
     "config.example.toml", "docs/PUBLISHING.md", "docs/MARKETPLACE_SUBMISSION.md", "docs/ICON.md",
+    "docs/OPTIMIZATION.md", "docs/share_samples.json", "docs/share_prompt_v063.json",
+    "scripts/preview_shares.py", "scripts/run_tests.py", "scripts/validate_release.py",
+    "tests/test_autopilot.py", "tests/test_client_plugin.py", "tests/test_recovery.py", "tests/test_replies.py",
+    "tests/test_sharing.py", "tests/test_webui.py", "tests/test_handoff.py",
 )
 
 

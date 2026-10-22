@@ -16,6 +16,7 @@ OUTCOMES = {
     "sent": "已提交评论", "rejected": "平台拒绝", "unknown": "发送结果待核对",
     "pending": "发送中", "cancelled": "已取消", "acknowledged": "已人工核对", "blocked": "发送被拦截",
     "deferred": "冷却等待，下次重新判断",
+    "quota_wait": "额度等待，跨日后重新判断", "expired": "等待任务已过期",
     "new": "等待判断", "would_reply": "拟跟进回复",
 }
 BLOCKS = {"daily_limit": "今日评论额度已满", "cooldown": "仍在评论间隔中", "duplicate_text": "评论完全重复",
@@ -69,6 +70,7 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
         result.update(title="自主浏览意愿", outcome="去浏览" if row["should_browse"] else "暂时不刷",
                       reason=row["reason"], summary=row["reason"],
                       next_time=local_time(row["next_check_at"], timezone))
+        result['comment'] = '希望查看：'+', '.join(json.loads(row.get('selected_bvids','[]')))
         return result
     try:
         detail = json.loads(row["detail"])
@@ -92,6 +94,8 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
 
 
 def retry_status(row: Dict[str, Any], timezone: str) -> str:
+    if row.get('outcome') in {'quota_wait','deferred'} and row.get('retry_at',0)>0:
+        return f"{local_time(row['retry_at'],timezone)} 起可重新读取与判断；旧草稿不会直接发送"
     if row.get('outcome') not in RETRY_OUTCOMES:
         return ''
     failures = row.get('failures',0)

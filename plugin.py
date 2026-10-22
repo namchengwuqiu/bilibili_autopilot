@@ -7,6 +7,7 @@ import asyncio
 import base64
 import contextlib
 import re
+import time
 
 import httpx
 
@@ -14,8 +15,19 @@ from maibot_sdk import API, Command, MaiBotPlugin
 
 from .client import BiliClient, LoginRequired, PlatformError
 from .config import AutopilotConfig
-from .engine import Autopilot
-from .models import ModelResponseError, ModelTimeoutError, VideoItem, local_day_start, parse_share_text, share_prompt
+from .engine import Autopilot, ReadWaiting
+from .models import (
+    DecisionValidationError,
+    ModelResponseError,
+    ModelTimeoutError,
+    VideoItem,
+    local_day_start,
+    parse_share_text,
+    parse_support,
+    polish_prompt,
+    share_prompt,
+    support_prompt,
+)
 from .sharing import SHARE_OUTCOMES, VideoSharer
 from .state import StateStore
 from .webui import local_time, record_row
@@ -54,11 +66,18 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         data_dir = Path(self.ctx.paths.data_dir)
         self.client = BiliClient(data_dir / "credential.json")
-        self.engine = Autopilot(self.client, StateStore(data_dir / "state.sqlite3"),
-                                lambda: self.config, self._generate, self._persona)
+        self.engine = Autopilot(
+            self.client, StateStore(data_dir / "state.sqlite3"), lambda: self.config, self._generate, self._persona
+        )
         await self.engine.initialize()
-        self.sharer = VideoSharer(self.engine.store, lambda: self.config, self.ctx.chat,
-                                  self.ctx.send, self.engine.may_publish, self._compose_share)
+        self.sharer = VideoSharer(
+            self.engine.store,
+            lambda: self.config,
+            self.ctx.chat,
+            self.ctx.send,
+            self.engine.may_publish,
+            self._compose_share,
+        )
         self.engine.share_video = self.sharer.share
         self._share_targets = await self.sharer.targets_summary()
         try:
@@ -96,10 +115,20 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         return "\n".join(str(profile.get(key, "")) for key in ("personality", "reply_style"))
 
     async def _generate(self, prompt: Any, cfg: AutopilotConfig) -> str:
+        return await self._generate_candidates(prompt, cfg)
+
+    async def _generate_candidates(self, prompt: Any, cfg: AutopilotConfig) -> str:
         # 沿用 Host 任务的输出额度；思考模型可能先消耗大量 token 才返回 JSON 正文。
         candidates = cfg.model.candidates or [""]
         response_error = None
+        stage = "model_generation"
+        if isinstance(prompt, list) and prompt:
+            match = re.search(r"\[autopilot:([a-z_]+)\]", str(prompt[0].get("content", "")))
+            if match:
+                stage = match.group(1)
         for index, model in enumerate(candidates):
+            started = time.monotonic()
+            outcome, reported_usage = "failed", {}
             try:
                 # 每个模型单独计时，不能在引擎外层用单模型时限截断整个切换流程。
                 kwargs = {"task_name": cfg.model.task, "model_name": model} if model else {"model": cfg.model.task}
@@ -107,12 +136,31 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
                     self.ctx.llm.generate(prompt, **kwargs, timeout_ms=(cfg.model.timeout_seconds + 5) * 1000),
                     timeout=cfg.model.timeout_seconds,
                 )
+                if isinstance(response, dict):
+                    usage = response.get("usage") if isinstance(response.get("usage"), dict) else response
+                    reported_usage = {
+                        key: usage[key]
+                        for key in (
+                            "prompt_tokens",
+                            "completion_tokens",
+                            "total_tokens",
+                            "prompt_cache_hit_tokens",
+                            "prompt_cache_miss_tokens",
+                        )
+                        if isinstance(usage.get(key), (int, float)) and not isinstance(usage.get(key), bool)
+                    }
                 if isinstance(response, dict) and response.get("success") is False:
                     # Host 的能力接口将底层异常包装为失败响应；仅识别超时，不公开异常原文。
                     if re.search(r"timeout|timed[ _-]?out|超时", str(response.get("error", "")), re.I):
                         raise ModelTimeoutError("模型调用超时")
-                return self._model_text(response)
+                result = self._model_text(response)
+                outcome = "success"
+                return result
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
             except (asyncio.TimeoutError, httpx.TimeoutException, ModelTimeoutError):
+                outcome = "timeout"
                 reason = "调用超时"
             except ModelResponseError as exc:
                 response_error = exc
@@ -121,10 +169,23 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
                 # SDK 的 RPC 超时不是 TimeoutError，而是带 E_TIMEOUT 代码的异常。
                 if getattr(exc, "code", None) != "E_TIMEOUT":
                     raise
+                outcome = "timeout"
                 reason = "调用超时"
+            finally:
+                if self.engine is not None:
+                    await asyncio.to_thread(
+                        self.engine.store.model_call,
+                        self.client.uid if self.client is not None else "",
+                        stage, time.time(), time.monotonic() - started, outcome, reported_usage,
+                    )
             if index + 1 < len(candidates):
-                self.ctx.logger.warning("B站模型未返回有效正文：%s（候选 %s/%s）；%s；切换下一个模型",
-                                        model or cfg.model.task,index+1,len(candidates),reason)
+                self.ctx.logger.warning(
+                    "B站模型未返回有效正文：%s（候选 %s/%s）；%s；切换下一个模型",
+                    model or cfg.model.task,
+                    index + 1,
+                    len(candidates),
+                    reason,
+                )
         if response_error is not None:
             raise ModelResponseError(f"候选模型未返回有效正文：{response_error}；本次跳过，后续有限重查")
         raise ModelTimeoutError("候选模型均超时，本次跳过；自动运行保持开启，下轮继续")
@@ -132,8 +193,63 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
     async def _compose_share(self, uid: str, item: VideoItem, cfg: AutopilotConfig) -> str:
         assert self.engine is not None
         context = await asyncio.to_thread(self.engine.store.share_context, uid, item.bvid)
-        prompt = share_prompt(item, context, persona=await self._persona(), extra_style=cfg.model.extra_style)
-        return parse_share_text(await self._generate(prompt, cfg))
+        return await asyncio.wait_for(self._share_steps(item, context, cfg), timeout=cfg.share.total_timeout_seconds)
+
+    async def _share_steps(
+        self, item: VideoItem, context: Dict[str, Any], cfg: AutopilotConfig,
+        *, trace: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        # 仅独立预览工具提供 trace；运行账号不会额外保存模型原文。
+        def record(**values: Any) -> None:
+            if trace is not None:
+                trace.update(values)
+
+        persona = await self._persona()
+        prompt = share_prompt(item, context, persona=persona, extra_style=cfg.model.extra_style)
+        raw = await self._generate(prompt, cfg)
+        record(draft_raw=raw, result_mode="skipped")
+        draft = parse_share_text(raw)
+        record(draft=draft)
+
+        async def verify(text: str, original: str = "") -> None:
+            raw = await asyncio.wait_for(
+                self._generate(support_prompt(text, context.get("content_evidence", {}), draft=original), cfg),
+                timeout=cfg.model.review_timeout_seconds,
+            )
+            review = parse_support(raw)
+            record(**{"polish_review" if original else "draft_review": review})
+            if not review["supported"]:
+                raise DecisionValidationError("unsupported_share", "群分享正文缺少依据或新增了草稿之外的事实")
+
+        await verify(draft)
+        if not cfg.share.polish_enabled:
+            record(result_mode="disabled")
+            return draft
+        if self.config != cfg or (self.engine is not None and not self.engine.may_publish()):
+            record(result_mode="cancelled")
+            return draft  # 最终发送路径仍会复核暂停和配置。
+        polish_cfg = cfg.model_copy(deep=True)
+        if cfg.share.polish_model.strip():
+            polish_cfg.model.candidates = [cfg.share.polish_model.strip()]
+
+        async def polish() -> str:
+            raw = await self._generate(
+                polish_prompt(item, context, draft, persona=persona, extra_style=cfg.model.extra_style), polish_cfg
+            )
+            record(polish_raw=raw)
+            text = parse_share_text(raw)
+            record(polish_candidate=text)
+            await verify(text, draft)
+            record(result_mode="polished")
+            return text
+
+        try:
+            return await asyncio.wait_for(polish(), timeout=cfg.share.polish_timeout_seconds)
+        except asyncio.CancelledError:
+            raise
+        except (ValueError, ModelResponseError, asyncio.TimeoutError) as exc:
+            record(result_mode="fallback", fallback_reason=getattr(exc, "code", type(exc).__name__))
+            return draft  # 仅回退已通过格式和依据复核的原稿，不发送失败输出。
 
     @staticmethod
     def _model_text(response: Any) -> str:
@@ -152,11 +268,21 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         try:
             while True:
                 self._wake.clear()
-                if (self.engine is not None and self.engine.paused and self.config.plugin.enabled
-                        and self.config.browse.auto_start and self.client is not None and self.client.uid
-                        and self.engine.pause_kind in {"initial", "login", "disabled"}):
+                if self.engine is not None:
+                    await asyncio.to_thread(self.engine.store.clean_evidence, self.engine.clock())
+                if (
+                    self.engine is not None
+                    and self.engine.paused
+                    and self.config.plugin.enabled
+                    and self.config.browse.auto_start
+                    and self.client is not None
+                    and self.client.uid
+                    and self.engine.pause_kind in {"initial", "login", "disabled"}
+                ):
                     try:
                         await self.engine.start(automatic=True)
+                    except ReadWaiting as exc:
+                        self.engine.last_result = str(exc)
                     except (LoginRequired, ModelResponseError, PlatformError) as exc:
                         await self.engine.pause(str(exc))
                 if self.engine is not None and not self.engine.paused and self.config.plugin.enabled:
@@ -167,7 +293,11 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
                     self.ctx.logger.info("B站浏览轮次结束：%s", "已暂停" if self.engine.paused else "完成")
                     del result
                 try:
-                    delay = await self.engine.next_check_delay() if self.engine is not None else self.config.browse.interval_seconds
+                    delay = (
+                        await self.engine.next_check_delay()
+                        if self.engine is not None
+                        else self.config.browse.interval_seconds
+                    )
                     await asyncio.wait_for(self._wake.wait(), timeout=delay)
                 except asyncio.TimeoutError:
                     pass
@@ -206,46 +336,81 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         assert self.engine is not None and self.client is not None
         cfg = self.config
         uid = self.client.uid
-        stats = await asyncio.to_thread(self.engine.store.stats, uid, local_day_start(self.engine.clock(), cfg.browse.timezone))
+        stats = await asyncio.to_thread(
+            self.engine.store.stats, uid, local_day_start(self.engine.clock(), cfg.browse.timezone)
+        )
         choice = await asyncio.to_thread(self.engine.store.latest_browse_decision, uid)
         reply_last = await asyncio.to_thread(self.engine.store.last_reply_check, uid)
         last_share = await asyncio.to_thread(self.engine.store.latest_share, uid)
+        recoveries = await asyncio.to_thread(self.engine.store.recoveries, uid)
+        usage = await asyncio.to_thread(
+            self.engine.store.model_usage, uid, local_day_start(self.engine.clock(), cfg.browse.timezone)
+        )
         busy = self._job is not None and not self._job.done()
         return {
             "account": f"{self.client.name}（UID {uid}）" if uid else "尚未登录，可在本页扫码登录",
-            "state": "已暂停" if self.engine.paused else "自主运行中" if cfg.browse.autonomous_enabled else "定时运行中",
+            "state": "已暂停"
+            if self.engine.paused
+            else "自主运行中"
+            if cfg.browse.autonomous_enabled
+            else "定时运行中",
             "mode": "允许自动评论" if cfg.comment.publish_enabled else "仅预览评论",
             "comment_cooldown": (self.engine.comment_cooldown(stats, cfg) or "已满足发送间隔")
-                                if cfg.comment.publish_enabled else "仅预览，不受发送冷却限制",
+            if cfg.comment.publish_enabled
+            else "仅预览，不受发送冷却限制",
             "views": f"{stats['views']} / {cfg.browse.videos_per_day}",
             "attempts": f"{stats['attempts']} / {cfg.comment.per_day}",
             "replies": f"{stats['reply_attempts']} / {cfg.replies.per_day}（今日跟进发送尝试）",
             "reply_analyses": f"{stats['reply_analyses']} / {cfg.replies.analyses_per_day}",
-            "reply_next_check": (local_time(reply_last + cfg.replies.interval_seconds,cfg.browse.timezone)
-                                 if cfg.replies.enabled and reply_last else '等待首次检查' if cfg.replies.enabled else '跟进回复已关闭'),
+            "reply_next_check": (
+                local_time(reply_last + cfg.replies.interval_seconds, cfg.browse.timezone)
+                if cfg.replies.enabled and reply_last
+                else "等待首次检查"
+                if cfg.replies.enabled
+                else "跟进回复已关闭"
+            ),
             "reply_result": self.engine.last_reply_result,
             "share_targets": self._share_targets,
-            "share_result": (f"{local_time(last_share['ts'], cfg.browse.timezone)} {SHARE_OUTCOMES.get(last_share['status'], last_share['status'])}："
-                             f"QQ 群 {last_share['group_id']}；{last_share['detail']}" if last_share else "暂无群分享记录；仅新的视频评论提交成功后分享"),
+            "share_result": (
+                f"{local_time(last_share['ts'], cfg.browse.timezone)} {SHARE_OUTCOMES.get(last_share['status'], last_share['status'])}："
+                f"QQ 群 {last_share['group_id']}；{last_share['detail']}"
+                if last_share
+                else "暂无群分享记录；仅新的视频评论提交成功后分享"
+            ),
             "unresolved": "、".join(stats["unresolved"]) or "无",
             "pause_reason": self.engine.pause_reason or "无",
-            "choice": ("去浏览：" if choice["should_browse"] else "暂时不刷：") + choice["reason"] if choice else "尚未产生自主决定",
+            "choice": ("去浏览：" if choice["should_browse"] else "暂时不刷：") + choice["reason"]
+            if choice
+            else "尚未产生自主决定",
             "next_check": self.engine.next_check_status(choice, cfg),
             "check_range": f"{(cfg.browse.interval_seconds + 59) // 60}～{cfg.browse.max_check_minutes} 分钟",
             "job": f"执行中：{self._job_action}" if busy else "暂无手动任务",
             "operation": self._last_operation,
             "operation_state": "执行中" if busy else "完成" if self._last_operation_ok else "未完成，请查看结果",
             "last_round": self.engine.last_result,
-            "busy": busy or self.engine.lock.locked(), "qr": self._login_qr,
-            "commands": {action: f"/bili_auto {action}" for action in ("start", "pause", "preview", "replies", "login", "status", "history")},
+            "read_recovery": "；".join(
+                f"{w['stage']} 第{w['failures']}次失败，{local_time(w['retry_at'], cfg.browse.timezone)}可恢复：{w['reason']}"
+                for w in recoveries
+            )
+            or "无读取恢复等待",
+            "model_usage": f"今日 {usage['calls']} 次，累计 {usage['elapsed_seconds']} 秒；用量由 Host 返回时记录",
+            "busy": busy or self.engine.lock.locked(),
+            "qr": self._login_qr,
+            "commands": {
+                action: f"/bili_auto {action}"
+                for action in ("start", "pause", "preview", "replies", "login", "status", "history")
+            },
         }
 
     @API("autopilot_records", description="分页读取当前 B 站账号的浏览、评论或自主决定记录", version="1")
     async def autopilot_records(self, kind: str = "visits", search: str = "", page: int = 1) -> Dict[str, Any]:
         assert self.engine is not None and self.client is not None
         data = await asyncio.to_thread(self.engine.store.page_records, self.client.uid, kind, search, page)
-        return {"rows": [record_row(row, kind, self.config.browse.timezone) for row in data["rows"]],
-                "pagination": data["pagination"], "is_reply": kind in {'replies','reply_attempts'}}
+        return {
+            "rows": [record_row(row, kind, self.config.browse.timezone) for row in data["rows"]],
+            "pagination": data["pagination"],
+            "is_reply": kind in {"replies", "reply_attempts"},
+        }
 
     @API("autopilot_command", description="执行 B 站插件自身的管理指令，不执行系统命令", version="1")
     async def autopilot_command(self, command: str) -> Dict[str, Any]:
@@ -287,8 +452,9 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         if not isinstance(bvid, str) or not re.fullmatch(r"BV[0-9A-Za-z]{10}", bvid.strip()):
             return self._ui_result(False, "请填写完整 BV 号，例如 BV1234567890")
         changed = await asyncio.to_thread(self.engine.store.acknowledge, self.client.uid, bvid.strip())
-        return self._ui_result(changed, "已记为核对完成；该视频不会重发，可恢复运行"
-                               if changed else "没有找到该视频的未知发送记录")
+        return self._ui_result(
+            changed, "已记为核对完成；该视频不会重发，可恢复运行" if changed else "没有找到该视频的未知发送记录"
+        )
 
     async def _background(self, action: str, stream_id: str) -> None:
         assert self.engine is not None and self.client is not None
@@ -329,6 +495,9 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             await self._respond(stream_id, result)
         except asyncio.CancelledError:
             raise
+        except ReadWaiting as exc:
+            self._last_operation, self._last_operation_ok = str(exc), False
+            await self._respond(stream_id, str(exc), False)
         except (LoginRequired, PlatformError) as exc:
             await self.engine.pause(str(exc))
             self._last_operation, self._last_operation_ok = str(exc), False
@@ -348,12 +517,21 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         description="管理B站自主浏览与评论",
         pattern=COMMAND_PATTERN,
     )
-    async def command(self, stream_id: str = "", platform: str = "", user_id: str = "",
-                      group_id: str = "", matched_groups: Optional[Dict[str, str]] = None,
-                      is_local_operator: bool = False, **kwargs: Any):
+    async def command(
+        self,
+        stream_id: str = "",
+        platform: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        matched_groups: Optional[Dict[str, str]] = None,
+        is_local_operator: bool = False,
+        **kwargs: Any,
+    ):
         del kwargs
         if not self._authorized(platform, user_id, is_local_operator):
-            return await self._respond(stream_id, "无权使用此命令；请先在插件配置中设置 admin_users（QQ号或平台:用户号）", False)
+            return await self._respond(
+                stream_id, "无权使用此命令；请先在插件配置中设置 admin_users（QQ号或平台:用户号）", False
+            )
         if self.engine is None or self.client is None:
             return await self._respond(stream_id, "插件尚未就绪", False)
         action = (matched_groups or {}).get("action") or "help"
@@ -386,8 +564,11 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
                 if not bvid:
                     return await self._respond(stream_id, "自行核对发送结果后，使用 /bili_auto ack BV号", False)
                 changed = await asyncio.to_thread(self.engine.store.acknowledge, self.client.uid, bvid)
-                return await self._respond(stream_id, "已记为核对完成；该视频不会重发，可使用 start 继续"
-                                           if changed else "没有找到该视频的未知发送记录", changed)
+                return await self._respond(
+                    stream_id,
+                    "已记为核对完成；该视频不会重发，可使用 start 继续" if changed else "没有找到该视频的未知发送记录",
+                    changed,
+                )
             return await self._respond(stream_id, HELP)
         except (LoginRequired, PlatformError) as exc:
             return await self._respond(stream_id, str(exc), False)

@@ -36,7 +36,7 @@ class ReplyEngineTests(unittest.IsolatedAsyncioTestCase):
         self.client.publish_reply.return_value='600'
         self.generate=AsyncMock(return_value=ANSWER)
         self.store=StateStore(Path(self.temp.name)/'state.sqlite3')
-        self.engine=Autopilot(self.client,self.store,lambda:self.cfg,self.generate,AsyncMock(return_value='自然随和'),lambda:self.now)
+        self.engine=Autopilot(self.client,self.store,lambda:self.cfg,self.generate,AsyncMock(return_value='自然随和'),lambda:self.now,review=AsyncMock(return_value=json.dumps({"supported":True,"kind":"factual","reason":"模拟复核通过"})))
         await self.engine.initialize()
         await self.engine.start()
         self.assertEqual(self.store.reserve('1',MESSAGE.bvid,MESSAGE.root_text,NOW-7200,0,3,3600,.88),'reserved')

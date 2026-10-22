@@ -173,7 +173,7 @@ class EngineRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.generate=AsyncMock(return_value=VALID)
         self.store=StateStore(Path(self.temp.name)/'state.sqlite3')
         self.engine=Autopilot(self.client,self.store,lambda:self.cfg,self.generate,
-                             AsyncMock(return_value='自然随和'),lambda:self.now)
+                             AsyncMock(return_value='自然随和'),lambda:self.now,review=AsyncMock(return_value=json.dumps({"supported":True,"kind":"factual","reason":"模拟复核通过"})))
         await self.engine.initialize()
         await self.engine.start()
 

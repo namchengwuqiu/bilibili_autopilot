@@ -484,6 +484,22 @@
                     "source": "overview",
                     "field": "last_round"
                   }
+                },
+                {
+                  "type": "text",
+                  "label": "只读网络恢复",
+                  "value": {
+                    "source": "overview",
+                    "field": "read_recovery"
+                  }
+                },
+                {
+                  "type": "text",
+                  "label": "模型调用与耗时",
+                  "value": {
+                    "source": "overview",
+                    "field": "model_usage"
+                  }
                 }
               ]
             }
