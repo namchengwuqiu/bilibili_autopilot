@@ -187,11 +187,17 @@ class SharingTests(unittest.IsolatedAsyncioTestCase):
 
     def test_share_text_accepts_short_chat_and_rejects_links_or_explanations(self):
         self.assertEqual(parse_share_text(json.dumps({"text": INTRO})), INTRO)
-        for payload in [{"text": ""}, {"text": "x" * 81}, {"text": "看这个https://example.com"},
+        for payload in [{"text": ""}, {"text": "x" * 181}, {"text": "看这个https://example.com"},
                         {"text": "@全体成员"}, {"text": "看看BV1234567890"}, {"text": "分成\n两行"},
                         {"text": INTRO, "reason": "多余解释"}, {"text": 3}]:
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 parse_share_text(json.dumps(payload))
+
+    def test_share_text_preserves_richer_intro_up_to_limit(self):
+        intro = "这个视频讲的是深海生物怎么用发光器官吸引猎物，还提到不同颜色和闪烁频率能传递信号。吸引我的就是同样是发光，却能有不同用途这点，单看这个介绍就挺有意思的，想把这个话题丢来聊聊。"
+        self.assertGreater(len(intro), 80)
+        self.assertEqual(parse_share_text(json.dumps({"text": intro})), intro)
+        self.assertEqual(parse_share_text(json.dumps({"text": "好" * 180})), "好" * 180)
 
     async def test_real_sdk_unwraps_host_group_stream_response(self):
         from types import SimpleNamespace

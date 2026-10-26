@@ -1,6 +1,6 @@
 [project]
 name = "maibot-bilibili-autopilot"
-version = "0.7.1"
+version = "0.7.2"
 description = "Browse Bilibili recommendations and selectively comment with MaiBot"
 requires-python = ">=3.10"
 dependencies = [
