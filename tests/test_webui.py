@@ -223,7 +223,7 @@ class WebUITests(unittest.IsolatedAsyncioTestCase):
         row = {'ts': 1, 'bvid': ITEM.bvid, 'mode': 'publish', 'outcome': 'deferred',
                'detail': json.dumps({'title': ITEM.title, 'comment': '待重新判断的评论', 'reason': '评论冷却中，最早12:45可再次评论'})}
         result = record_row(row, 'visits', 'Asia/Shanghai')
-        self.assertEqual(result['outcome'], '冷却等待，下次重新判断')
+        self.assertEqual(result['outcome'], '候选保留中（评论冷却）')
         self.assertEqual(result['title'], ITEM.title)
         self.assertEqual(result['comment'], '待重新判断的评论')
         self.assertIn('12:45', result['reason'])

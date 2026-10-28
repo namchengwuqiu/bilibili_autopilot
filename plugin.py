@@ -375,6 +375,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             if cfg.browse.autonomous_enabled
             else "定时运行中",
             "mode": "允许自动评论" if cfg.comment.publish_enabled else "仅预览评论",
+            "candidate_pool": await self.engine.candidate_pool_status(),
             "comment_cooldown": (self.engine.comment_cooldown(stats, cfg) or "已满足发送间隔")
             if cfg.comment.publish_enabled
             else "仅预览，不受发送冷却限制",

@@ -59,8 +59,8 @@ class BrowseSection(PluginConfigBase):
 
     __ui_label__ = "浏览与兴趣"
     __ui_order__ = 1
-    backlog_max_items: int = Field(default=24, ge=1, le=100, description="未发送等待视频队列上限，超限淘汰最旧项")
-    backlog_max_age_hours: int = Field(default=48, ge=1, le=168, description="未发送等待视频有效期，小时")
+    backlog_max_items: int = Field(default=24, ge=1, le=100, description="评论候选池上限，超限按兴趣、新鲜度与等待时间择优保留")
+    backlog_max_age_hours: int = Field(default=48, ge=1, le=168, description="评论候选有效期，小时；候选不保证发送")
     read_retry_base_seconds: int = Field(
         default=60, ge=10, le=600, description="只读网络失败退避起点，最多四次后每小时探测"
     )

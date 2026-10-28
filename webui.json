@@ -270,6 +270,11 @@
                 },
                 {
                   "type": "text",
+                  "label": "评论候选池",
+                  "value": {"source": "overview", "field": "candidate_pool"}
+                },
+                {
+                  "type": "text",
                   "label": "意愿检查间隔",
                   "value": {
                     "source": "overview",

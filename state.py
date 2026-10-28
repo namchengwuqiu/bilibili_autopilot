@@ -190,6 +190,9 @@ class StateStore:
                 "SELECT DISTINCT uid FROM visits WHERE mode='publish' AND outcome IN ('quota_wait','deferred')"
             ).fetchall():
                 self._trim_waits(db, row["uid"], now, wait_limit)
+            # 旧版容量淘汰也写成 expired；只有时间戳能明确证明未到期时才更正文案。
+            db.execute("UPDATE visits SET outcome='evicted' WHERE mode='publish' AND outcome='expired' "
+                       "AND updated_at>0 AND expires_at>updated_at")
             if seed_analyses:
                 db.execute("INSERT INTO analyses(uid,kind,item_id,mode,ts) SELECT uid,'video',bvid,mode,ts FROM visits")
                 db.execute(
@@ -348,8 +351,12 @@ class StateStore:
             if row is None:
                 return False
             if row["outcome"] == "quota_wait":
-                return row["retry_at"] > now or (row["expires_at"] > 0 and row["expires_at"] <= now)
-            if row["outcome"] == "deferred" or (row["outcome"] == "blocked" and row["detail"] == "cooldown"):
+                return (include_deferred and row["expires_at"] > 0) or row["retry_at"] > now or (
+                    row["expires_at"] > 0 and row["expires_at"] <= now
+                )
+            if row["outcome"] == "blocked" and row["detail"] == "cooldown":
+                return include_deferred and row["retry_at"] > now
+            if row["outcome"] == "deferred":
                 return include_deferred or (
                     check_deadline and (row["retry_at"] > now or (row["expires_at"] > 0 and row["expires_at"] <= now))
                 )
@@ -382,46 +389,72 @@ class StateStore:
                         break
             return result
 
-    def deferred_videos(
-        self,
-        uid: str,
-        eligible: Optional[Callable[[VideoItem], bool]] = None,
-        now: Optional[float] = None,
-        limit: int = 24,
-    ) -> List[VideoItem]:
-        """只恢复明确未发送的冷却视频；已占用发送机会的视频永不重试。"""
+    @staticmethod
+    def _candidate_score(row: Dict[str, Any], now: float) -> float:
+        """兴趣为主，兼顾新鲜度及等待机会；不保证任何候选一定发送。"""
+        try:
+            fields = json.loads(row["detail"])
+        except (ValueError, TypeError):
+            fields = {}
+        interest = fields.get("interest", 0) if isinstance(fields, dict) else 0
+        interest = float(interest) if type(interest) in (int, float) and 0 <= interest <= 1 else 0
+        hours = max(0, now - row["ts"]) / 3600
+        return interest * .75 + .15 / (1 + hours / 24) + .10 * min(hours / 12, 1)
+
+    def candidates(
+        self, uid: str, eligible: Optional[Callable[[VideoItem], bool]] = None,
+        now: Optional[float] = None, limit: int = 24, *, ready_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """只读取从未产生发送意图的候选；清理到期、已屏蔽项后择优排序。"""
+        check_deadline = now is not None
+        now = time.time() if now is None else now
         with self.connect() as db:
             rows = db.execute(
                 "SELECT v.* FROM visits v WHERE v.uid=? AND v.mode='publish' "
                 "AND v.outcome IN ('deferred','quota_wait') AND NOT EXISTS "
-                "(SELECT 1 FROM attempts a WHERE a.uid=v.uid AND a.bvid=v.bvid) "
-                "ORDER BY v.ts",
-                (uid,),
-            )
+                "(SELECT 1 FROM attempts a WHERE a.uid=v.uid AND a.bvid=v.bvid)", (uid,),
+            ).fetchall()
             result = []
-            for row in rows:
-                if now is not None and row["expires_at"] and row["expires_at"] <= now:
-                    db.execute(
-                        "UPDATE visits SET outcome='expired',updated_at=? WHERE uid=? AND bvid=? AND mode='publish'",
-                        (now, uid, row["bvid"]),
-                    )
+            for raw in rows:
+                row = dict(raw)
+                if check_deadline and row["expires_at"] and row["expires_at"] <= now:
+                    db.execute("UPDATE visits SET outcome='expired',updated_at=? WHERE uid=? AND bvid=? AND mode='publish'",
+                               (now, uid, row["bvid"]))
                     continue
                 try:
-                    item = VideoItem(**json.loads(row["detail"])["video"])
+                    fields = json.loads(row["detail"])
+                    item = VideoItem(**fields["video"])
                 except (ValueError, TypeError, KeyError):
                     continue
                 if eligible is not None and not eligible(item):
-                    db.execute(
-                        "UPDATE visits SET outcome='cancelled' WHERE uid=? AND bvid=? AND mode='publish'",
-                        (uid, row["bvid"]),
-                    )
+                    db.execute("UPDATE visits SET outcome='cancelled',updated_at=? WHERE uid=? AND bvid=? AND mode='publish'",
+                               (now, uid, row["bvid"]))
                     continue
-                if now is not None and row["retry_at"] > now:
+                if ready_only and check_deadline and row["retry_at"] > now:
                     continue
-                result.append(item)
-                if len(result) == limit:
-                    break
-            return result
+                row.update(item=item, fields=fields)
+                result.append(row)
+            result.sort(key=lambda row: (self._candidate_score(row, now), -row["ts"], row["bvid"]), reverse=True)
+            return result[:limit]
+
+    def deferred_videos(
+        self, uid: str, eligible: Optional[Callable[[VideoItem], bool]] = None,
+        now: Optional[float] = None, limit: int = 24,
+    ) -> List[VideoItem]:
+        return [row["item"] for row in self.candidates(uid, eligible, now, limit)]
+
+    def record_candidate_selection(self, uid: str, candidates: List[Dict[str, Any]], selected: str,
+                                   reason: str, now: float, next_check: float) -> None:
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("candidate_check:" + uid, str(next_check)))
+            for row in candidates:
+                fields = dict(row["fields"])
+                fields.update(selection_reason=reason, selection_time=now,
+                              selected=row["bvid"] == selected)
+                # 选择未命中不是浏览，不更新排序时间、兴趣或分析计数。
+                db.execute("UPDATE visits SET detail=? WHERE uid=? AND bvid=? AND mode='publish' "
+                           "AND outcome IN ('deferred','quota_wait')",
+                           (json.dumps(fields, ensure_ascii=False), uid, row["bvid"]))
 
     def wait_video(
         self,
@@ -443,14 +476,16 @@ class StateStore:
             )
             self._trim_waits(db, uid, now, limit)
 
-    @staticmethod
-    def _trim_waits(db: sqlite3.Connection, uid: str, now: float, limit: int) -> None:
-        db.execute(
-            "UPDATE visits SET outcome='expired',updated_at=? WHERE uid=? AND mode='publish' "
-            "AND outcome IN ('quota_wait','deferred') AND bvid IN (SELECT bvid FROM visits WHERE uid=? "
-            "AND mode='publish' AND outcome IN ('quota_wait','deferred') ORDER BY ts DESC LIMIT -1 OFFSET ?)",
-            (now, uid, uid, limit),
-        )
+    @classmethod
+    def _trim_waits(cls, db: sqlite3.Connection, uid: str, now: float, limit: int) -> None:
+        db.execute("UPDATE visits SET outcome='expired',updated_at=? WHERE uid=? AND mode='publish' "
+                   "AND outcome IN ('quota_wait','deferred') AND expires_at>0 AND expires_at<=?", (now, uid, now))
+        rows = db.execute("SELECT * FROM visits WHERE uid=? AND mode='publish' "
+                          "AND outcome IN ('quota_wait','deferred')", (uid,)).fetchall()
+        ranked = sorted(rows, key=lambda row: (cls._candidate_score(row, now), row["ts"], row["bvid"]), reverse=True)
+        for row in ranked[limit:]:
+            db.execute("UPDATE visits SET outcome='evicted',updated_at=? WHERE uid=? AND bvid=? AND mode='publish'",
+                       (now, uid, row["bvid"]))
 
     def postpone_waits(self, uid: str, until: float) -> None:
         with self.connect() as db:

@@ -7,21 +7,21 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`；当前版本：`0.7.2`。配置格式版本 `plugin.config_version=0.2.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本：`0.6.0`；当前版本：`0.8.0`。配置格式版本 `plugin.config_version=0.2.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
 1. 在公开仓库默认分支的根目录提交源码和资源，确保 `_manifest.json`、`plugin.py`、`README.md`、`LICENSE` 都位于根目录。
-2. 运行 `python scripts/validate_release.py --tag v0.7.2`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
+2. 运行 `python scripts/validate_release.py --tag v0.8.0`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
 3. 确认源码仓库不包含 `config.toml`、`config_back/`、登录凭据、二维码、数据库及运行数据。默认示例仅使用 `config.example.toml`。
-4. 创建并推送 `v0.7.2` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
+4. 创建并推送 `v0.8.0` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
 5. 确认 Release 已公开发布，随后按 [市场登记文案](MARKETPLACE_SUBMISSION.md) 在插件中心创建新增插件 Issue。
 6. 等待市场验证、同步及审核收录。只有仓库代码或 Tag 不满足首次登记要求，草稿 Release 也不满足要求。
 
 手动生成用于检查的发布附件：
 
 ```sh
-python scripts/validate_release.py --tag v0.7.2 \
+python scripts/validate_release.py --tag v0.8.0 \
   --archive dist/bilibili-autopilot.zip --notes dist/release-notes.md
 ```
 
@@ -69,3 +69,11 @@ ZIP 根目录直接包含插件文件，不套多层目录。脚本使用固定�
 群分享改为围绕具体看点与分享原因生成自然的短段落，通常2～3句话、50～120字，正文上限由80字提高至180字；润色保留有效信息，不再优先压缩成半句话。依据不足时允许简短，继续执行格式、亲身经历与内容依据校验。
 
 不修改配置格式、依赖或数据库结构，保留现有配置、登录态及去重记录。更新后重载插件；历史分享不会补发。容器内运行225项隔离测试，224项通过、1项跳过；新增超过旧80字上限及180字边界的文案校验覆盖。
+
+## 0.8.0 升级与验证
+
+冷却与额度不足时只保存兴趣候选，不生成正文。候选评论在可发送时独立选片，模型可以放弃；选中后重新读取、判断与复核。浏览意愿检查、评论间隔与每日额度保持原配置。候选池按兴趣、新鲜度和等待时间保留，管理页区分容量淘汰与超时过期。
+
+保留实际 config.toml、凭据和最新状态库。先在管理页暂停并等 busy=false，使用SQLite backup备份；在隔离目录验证并生成发布包后，整套替换公共文件，再重载并恢复原运行状态。上线验收仅检查加载、页面、配置与状态保留，不通过真实发评论或群消息验证。
+
+不新增表或配置项。启动时对时间戳能明确证明的历史容量淘汰改记为 evicted，不恢复旧任务，不改变发送记录或分析计数；迁移幂等。候选选择节流保存在已有meta表，回滚旧版本时新增状态会作为历史终态显示，发送记录必须保留，不能用旧库覆盖新发送。隔离测试240项，239项通过，1项可选网络库测试跳过。

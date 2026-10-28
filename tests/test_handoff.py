@@ -84,6 +84,7 @@ class HandoffEngineTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.start()
 
     def quota(self):
+        self.generate.return_value = answer(comment="")
         self.cfg.comment.per_day = 1
         self.store.reserve("1", "BV0987654321", "今天早些时候的其他评论", self.now - 7200, 0, 10, 300, 0.88)
         self.store.finish("1", "BV0987654321", "sent", "400")
@@ -99,9 +100,10 @@ class HandoffEngineTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.initialize()
         self.client.recommended.return_value = []
         self.now = next_local_day(self.now, "Asia/Shanghai") + 36000
-        self.generate.return_value = answer(comment="这发光方式确实挺有趣")
+        self.generate.side_effect = [json.dumps({"selected_bvid": ITEM.bvid, "reason": "还想聊"}),
+                                     answer(comment="这发光方式确实挺有趣")]
         self.assertIn("已提交评论", await self.engine.round())
-        self.assertEqual(self.generate.await_count, 2)
+        self.assertEqual(self.generate.await_count, 3)
         self.assertEqual(self.client.publish.await_args.args[1], "这发光方式确实挺有趣")
 
     async def test_quota_and_cooldown_use_later_deadline(self):
@@ -271,7 +273,7 @@ class HandoffEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wait_and_recheck_leave_an_opportunity_for_new_content(self):
         self.cfg.browse.videos_per_round = 1
-        self.store.wait_video("1", ITEM, self.now, json.dumps({"video": asdict(ITEM)}), self.now, 48, 24)
+        self.store.wait_video("1", ITEM, self.now, json.dumps({"video": asdict(ITEM)}), self.now + 600, 48, 24)
         fresh = replace(ITEM, bvid="BV0987654321", up_uid="3")
         self.client.recommended.return_value = [fresh]
         self.client.understand.side_effect = lambda item, *args: (item, EVIDENCE)
@@ -280,6 +282,9 @@ class HandoffEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.understand.await_args_list[0].args[0], fresh)
         fresh2 = replace(fresh, bvid="BV1111111111")
         self.client.recommended.return_value = [fresh2]
+        self.now += 600
+        self.generate.side_effect = [json.dumps({"selected_bvid": ITEM.bvid, "reason": "这条还想聊"}),
+                                     answer(should_comment=False, comment="", evidence_quote="")]
         await self.engine.round()
         self.assertEqual(self.client.understand.await_args_list[1].args[0], ITEM)
 

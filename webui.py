@@ -15,8 +15,9 @@ OUTCOMES = {
     "invalid_decision": "判断校验失败", "skipped": "看过不评论 / 跳过", "would_comment": "拟发表评论",
     "sent": "已提交评论", "rejected": "平台拒绝", "unknown": "发送结果待核对",
     "pending": "发送中", "cancelled": "已取消", "acknowledged": "已人工核对", "blocked": "发送被拦截",
-    "deferred": "冷却等待，下次重新判断",
-    "quota_wait": "额度等待，跨日后重新判断", "expired": "等待任务已过期",
+    "deferred": "候选保留中（评论冷却）",
+    "quota_wait": "候选保留中（今日额度已满）", "expired": "超过有效期",
+    "evicted": "候选池已满，择优淘汰",
     "new": "等待判断", "would_reply": "拟跟进回复",
 }
 BLOCKS = {"daily_limit": "今日评论额度已满", "cooldown": "仍在评论间隔中", "duplicate_text": "评论完全重复",
@@ -88,6 +89,9 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
                   reason=BLOCKS.get(str(detail.get("reason", row["detail"])), str(detail.get("reason", row["detail"]))),
                   rpid=row["rpid"] if kind == "attempts" else "")
     result["summary"] = (result["comment"] or result["reason"])[:100]
+    if outcome in {"deferred", "quota_wait"} and detail.get("selection_time") and not detail.get("selected"):
+        result["outcome"] = "本次未选中，仍保留候选"
+        result["reason"] += "；最近选择：" + str(detail.get("selection_reason", ""))
     if detail.get('read_warning'):
         result['reason'] += f"；读取提示：{detail['read_warning']}，已使用字幕"
     return result
@@ -95,7 +99,7 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
 
 def retry_status(row: Dict[str, Any], timezone: str) -> str:
     if row.get('outcome') in {'quota_wait','deferred'} and row.get('retry_at',0)>0:
-        return f"{local_time(row['retry_at'],timezone)} 起可重新读取与判断；旧草稿不会直接发送"
+        return f"{local_time(row['retry_at'],timezone)} 起可参与候选选择；选中后重新读取与判断，不直接发送旧草稿"
     if row.get('outcome') not in RETRY_OUTCOMES:
         return ''
     failures = row.get('failures',0)

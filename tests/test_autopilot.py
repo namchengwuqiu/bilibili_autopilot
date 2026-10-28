@@ -376,6 +376,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.reserve(self.client.uid, "BV0987654321", "不重复的已有评论", self.now,
                                             0, 1, 3600, .88), "reserved")
         self.store.finish(self.client.uid, "BV0987654321", "sent", "existing")
+        self.generate.return_value = decision(comment="")
         self.now += 3601  # 单独验证每日限额，不受发送冷却影响。
         self.assertIn("daily_limit", await self.engine.round())
         self.client.recommended.assert_awaited_once()
@@ -390,7 +391,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.cfg.browse.interval_seconds = 600
         self.cfg.browse.max_check_minutes = 20
         browse = json.dumps({'should_browse': True, 'reason': '想看新视频', 'next_check_minutes': 10})
-        self.generate.side_effect = [browse, decision(), browse, decision()]
+        self.generate.side_effect = [browse, decision(comment=""), json.dumps({"selected_bvid": ITEM.bvid, "reason": "还想聊这条"}), decision()]
         result = await self.engine.round()
         self.assertIn('12:45:00', result)
         self.assertIn('冷却中', result)
@@ -417,6 +418,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.start()
         self.store.reserve(self.client.uid, 'BV0987654321', '不重复的已有评论', self.now, 0, 12, 0, .88)
         self.store.finish(self.client.uid, 'BV0987654321', 'sent', '1')
+        self.generate.return_value = decision(comment='')
         items = [replace(ITEM, bvid=f'BV{i:010}') for i in range(3)]
         self.client.recommended.return_value = items
         self.client.understand.side_effect = [(item, EVIDENCE) for item in items]
@@ -477,6 +479,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.reserve_reply(self.client.uid, message, '跟进讨论的回复', self.now,
                                                   0, 8, 900, 3, .88), 'reserved')
         self.store.finish_reply(self.client.uid, 900, 'sent', '501')
+        self.generate.return_value = decision(comment='')
         self.assertIn('12:45:00', await self.engine.round())
         self.client.recommended.assert_awaited_once()
         self.client.understand.assert_awaited_once()
@@ -501,13 +504,13 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.client.publish.assert_not_awaited()
         self.assertFalse(self.engine.paused)
         self.assertFalse(self.store.seen(self.client.uid, ITEM.bvid, 'publish'))
-        self.store.initialize()
+        self.store.initialize(self.now)
         self.now += self.cfg.comment.min_interval_seconds
         self.client.recommended.return_value = []  # 推荐列表已变化，仍恢复保留的视频。
-        self.generate.side_effect = None
+        self.generate.side_effect = [json.dumps({"selected_bvid": ITEM.bvid, "reason": "还想聊这条"}), decision()]
         result = await self.engine.round()
         self.assertIn('已提交评论', result)
-        self.assertEqual(self.generate.await_count, 2)  # 重新读取内容和判断，不能直接发送旧草稿。
+        self.assertEqual(self.generate.await_count, 3)  # 先选片，再重新读取内容和判断，不能直接发送旧草稿。
         self.client.publish.assert_awaited_once()
         self.assertEqual(self.store.deferred_videos(self.client.uid), [])
 

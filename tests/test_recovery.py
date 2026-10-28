@@ -264,6 +264,8 @@ class EngineRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.client.recommended.return_value = []
         self.client.understand.return_value = videos[-1],EVIDENCE
         self.now += 1000
+        if outcome == 'deferred':
+            self.generate.side_effect = [json.dumps({'selected_bvid': videos[-1].bvid, 'reason': '想聊这条'}), VALID]
         self.assertIn('已提交评论',await self.engine.round())
         self.client.understand.assert_awaited_once_with(videos[-1],self.cfg.model.content_max_chars)
         self.assertEqual(self.client.publish.await_args.args[0].bvid,videos[-1].bvid)
