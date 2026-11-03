@@ -7,21 +7,21 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`；当前版本：`0.8.0`。配置格式版本 `plugin.config_version=0.2.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本：`0.6.0`；当前版本：`0.8.3`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
 1. 在公开仓库默认分支的根目录提交源码和资源，确保 `_manifest.json`、`plugin.py`、`README.md`、`LICENSE` 都位于根目录。
-2. 运行 `python scripts/validate_release.py --tag v0.8.0`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
+2. 运行 `python scripts/validate_release.py --tag v0.8.3`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
 3. 确认源码仓库不包含 `config.toml`、`config_back/`、登录凭据、二维码、数据库及运行数据。默认示例仅使用 `config.example.toml`。
-4. 创建并推送 `v0.8.0` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
+4. 创建并推送 `v0.8.3` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
 5. 确认 Release 已公开发布，随后按 [市场登记文案](MARKETPLACE_SUBMISSION.md) 在插件中心创建新增插件 Issue。
 6. 等待市场验证、同步及审核收录。只有仓库代码或 Tag 不满足首次登记要求，草稿 Release 也不满足要求。
 
 手动生成用于检查的发布附件：
 
 ```sh
-python scripts/validate_release.py --tag v0.8.0 \
+python scripts/validate_release.py --tag v0.8.3 \
   --archive dist/bilibili-autopilot.zip --notes dist/release-notes.md
 ```
 
@@ -77,3 +77,13 @@ ZIP 根目录直接包含插件文件，不套多层目录。脚本使用固定�
 保留实际 config.toml、凭据和最新状态库。先在管理页暂停并等 busy=false，使用SQLite backup备份；在隔离目录验证并生成发布包后，整套替换公共文件，再重载并恢复原运行状态。上线验收仅检查加载、页面、配置与状态保留，不通过真实发评论或群消息验证。
 
 不新增表或配置项。启动时对时间戳能明确证明的历史容量淘汰改记为 evicted，不恢复旧任务，不改变发送记录或分析计数；迁移幂等。候选选择节流保存在已有meta表，回滚旧版本时新增状态会作为历史终态显示，发送记录必须保留，不能用旧库覆盖新发送。隔离测试240项，239项通过，1项可选网络库测试跳过。
+
+## 0.8.3 升级与验证
+
+本版修复自主浏览选片上限未传入提示词（#3），并接通聊天历史查询及查询事实到回复模型的交接（#2）。v0.8.1、v0.8.2 为本地验证版本，本版汇总 v0.8.0 之后的改动。
+
+保留 `config.toml`、凭据和最新状态库，更新公共文件并重载。配置格式为 `0.3.0`，由宿主补齐默认值；数据库自动补齐兼容字段，发送与分享记录继续去重，不补发历史任务。配置表单和示例已补齐中文说明，公开配置继续使用分享感想加视频链接。
+
+确认主程序已启用 `bilibili_autopilot_history` 后，可问“查询你最近在 B 站浏览和评论的记录”。旧记录可以直接查询；事实摘要按会话和目标消息交给回复模型，明确的 B 站活动问题在未重新调用工具时也会补查本地记录。查询无需重新登录，不额外请求 B 站或调用模型，不写入通用记忆库。仍需按记录区分已发送、预览和结果未知。
+
+完整隔离测试 278 项，277 项通过、1 项可选网络库测试跳过；真实 QQ 对话验证了自动补查和事实交接，评论状态边界通过离线模型回放验证。公开安装包由固定公共文件清单构建，不含部署配置、账号数据或日志。

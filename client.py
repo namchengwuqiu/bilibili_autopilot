@@ -332,6 +332,7 @@ class BiliClient:
             up_uid=str(info["owner"]["mid"]),
             up_name=str(info["owner"].get("name", ""))[:100],
             topic=str(info.get("tid") or info.get("tname") or item.topic)[:100],
+            cover=str(info.get("pic") or item.cover)[:2000],
         )
         if int(info.get("videos", 1)) > 1:
             return item, Evidence("unavailable", "")

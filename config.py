@@ -21,7 +21,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="0.2.0",
+        default="0.3.0",
         description="插件自动维护的配置格式版本",
         json_schema_extra={
             "label": "配置格式版本（无需修改）",
@@ -59,14 +59,40 @@ class BrowseSection(PluginConfigBase):
 
     __ui_label__ = "浏览与兴趣"
     __ui_order__ = 1
-    backlog_max_items: int = Field(default=24, ge=1, le=100, description="评论候选池上限，超限按兴趣、新鲜度与等待时间择优保留")
-    backlog_max_age_hours: int = Field(default=48, ge=1, le=168, description="评论候选有效期，小时；候选不保证发送")
-    read_retry_base_seconds: int = Field(
-        default=60, ge=10, le=600, description="只读网络失败退避起点，最多四次后每小时探测"
+    backlog_max_items: int = Field(
+        default=24, ge=1, le=100, description="评论候选池上限，超限按兴趣、新鲜度与等待时间择优保留",
+        json_schema_extra={
+            "label": "最多保留的评论候选数",
+            "hint": "默认保留 24 个视频，可填 1～100。评论冷却或额度用完时，感兴趣的视频可留待之后考虑；超出数量时按兴趣、新鲜度和等待时间择优保留，不保证每个候选都会发表评论。",
+        },
     )
-    max_per_up: int = Field(default=2, ge=1, le=10, description="每轮同一 UP 主最多分析的视频数")
+    backlog_max_age_hours: int = Field(
+        default=48, ge=1, le=168, description="评论候选有效期，小时；候选不保证发送",
+        json_schema_extra={
+            "label": "评论候选有效期（小时）",
+            "hint": "默认 48 小时＝2 天，可填 1～168。超过有效期的候选不再等待评论机会；发送前仍需重新读取内容并判断，不会直接发送旧草稿。",
+        },
+    )
+    read_retry_base_seconds: int = Field(
+        default=60, ge=10, le=600, description="只读网络失败退避起点，最多四次后每小时探测",
+        json_schema_extra={
+            "label": "读取失败首次重试等待（秒）",
+            "hint": "读取账号、推荐等请求遇到可重试的网络错误时，首次默认等待 60 秒，可填 10～600。连续失败会逐步延长等待，达到重试上限后每小时探测一次；不会自动重发评论。",
+        },
+    )
+    max_per_up: int = Field(
+        default=2, ge=1, le=10, description="每轮同一 UP 主最多分析的视频数",
+        json_schema_extra={
+            "label": "每轮同一 UP 主视频上限",
+            "hint": "默认每轮最多分析同一 UP 主的 2 个视频，可填 1～10，避免一轮推荐都来自同一个人。仍受每轮视频分析总上限约束。",
+        },
+    )
     max_per_topic: int = Field(
-        default=2, ge=1, le=10, description="每轮同一已知分区题材最多分析的视频数，未知题材不强行分类"
+        default=2, ge=1, le=10, description="每轮同一已知分区题材最多分析的视频数，未知题材不强行分类",
+        json_schema_extra={
+            "label": "每轮同一题材视频上限",
+            "hint": "默认每轮最多分析同一已知分区题材的 2 个视频，可填 1～10，让内容更丰富。没有题材信息的视频不强行归类；仍受每轮视频分析总上限约束。",
+        },
     )
     auto_start: bool = Field(
         default=True,
@@ -284,10 +310,26 @@ class ModelSection(PluginConfigBase):
     __ui_label__ = "模型"
     __ui_order__ = 3
     decision_budget_seconds: int = Field(
-        default=240, ge=20, le=900, description="每条评论或回复生成、复核及一次重生成的总时限"
+        default=240, ge=20, le=900, description="每条评论或回复生成、复核及一次重生成的总时限",
+        json_schema_extra={
+            "label": "评论与回复处理总时限（秒）",
+            "hint": "每条评论或跟进回复从生成到依据复核共用的时间预算，包含最多一次重生成。默认 240 秒＝4 分钟，可填 20～900；达到总时限后停止本次处理，不发送未完成复核的正文。",
+        },
     )
-    review_timeout_seconds: int = Field(default=45, ge=1, le=120, description="单次正文依据复核时限，失败不发送")
-    evidence_retention_days: int = Field(default=7, ge=1, le=30, description="本地引用片段与时间位置保留天数")
+    review_timeout_seconds: int = Field(
+        default=45, ge=1, le=120, description="单次正文依据复核时限，失败不发送",
+        json_schema_extra={
+            "label": "单次正文依据复核时限（秒）",
+            "hint": "检查生成正文是否得到已读取内容支持，默认每次最多等待 45 秒，可填 1～120。超时或复核不通过时不发送该正文，同时受相应处理总时限约束。",
+        },
+    )
+    evidence_retention_days: int = Field(
+        default=7, ge=1, le=30, description="本地引用片段与时间位置保留天数",
+        json_schema_extra={
+            "label": "内容依据缓存保留天数",
+            "hint": "默认保留本地引用片段和时间位置 7 天，可填 1～30，供后续分享等处理查阅。这里只控制内容依据缓存，不是浏览和评论历史记录的保留期限。",
+        },
+    )
     task: str = Field(
         default="replyer",
         description="Host 中用于判断兴趣和生成评论的模型任务",
@@ -425,17 +467,50 @@ class ShareSection(PluginConfigBase):
 
     __ui_label__ = "评论后分享视频"
     __ui_order__ = 5
-    polish_enabled: bool = Field(default=True, description="每条分享最多调用一次模型润色，所有群复用文案")
-    polish_model: str = Field(default="", max_length=200, description="润色使用 Host 已配置的模型名，留空沿用评论任务")
-    polish_timeout_seconds: int = Field(default=30, ge=1, le=120, description="分享润色独立时限，包含正文依据复核")
-    total_timeout_seconds: int = Field(default=120, ge=10, le=360, description="分享草稿、润色及复核的总时限")
+    miniapp_enabled: bool = Field(
+        default=False,
+        description="先发送 B 站 QQ 小程序卡片，确认成功后再发送分享感想",
+        json_schema_extra={
+            "label": "使用 QQ 小程序卡片分享",
+            "hidden": True,
+        },
+    )
+    polish_enabled: bool = Field(
+        default=True, description="每条分享最多调用一次模型润色，所有群复用文案",
+        json_schema_extra={
+            "label": "润色群分享文案",
+            "hint": "默认开启，在分享草稿基础上再润色一次，让表达更自然。同一视频发往多个群时复用文案；关闭后使用已通过依据复核的初稿。",
+        },
+    )
+    polish_model: str = Field(
+        default="", max_length=200, description="润色使用 Host 已配置的模型名，留空沿用评论任务",
+        json_schema_extra={
+            "label": "分享文案润色模型",
+            "hint": "填写麦麦已配置的具体模型名称，最多 200 字；留空沿用评论使用的模型任务及候选模型设置。仅在开启分享文案润色时生效。",
+            "placeholder": "留空沿用评论模型，或填写已配置的模型名称",
+        },
+    )
+    polish_timeout_seconds: int = Field(
+        default=30, ge=1, le=120, description="分享润色独立时限，包含正文依据复核",
+        json_schema_extra={
+            "label": "分享文案润色时限（秒）",
+            "hint": "润色及润色稿依据复核合计最多等待多久，默认 30 秒，可填 1～120。润色未完成或未通过复核时使用已通过复核的初稿；仍受分享文案处理总时限约束。",
+        },
+    )
+    total_timeout_seconds: int = Field(
+        default=120, ge=10, le=360, description="分享草稿、润色及复核的总时限",
+        json_schema_extra={
+            "label": "分享文案处理总时限（秒）",
+            "hint": "分享草稿生成、修改、润色和依据复核共用的时间预算，默认 120 秒＝2 分钟，可填 10～360。达到总时限后放弃本次分享，不影响已经成功发布的 B 站评论。",
+        },
+    )
     qq_group_ids: List[str] = Field(
         default_factory=list,
         max_length=10,
         description="评论成功后分享视频的 QQ 群号；默认留空，不分享",
         json_schema_extra={
             "label": "分享视频的 QQ 群号",
-            "hint": "默认留空，不分享。每项填写一个麦麦已加入的 QQ 群号，最多 10 个。仅实际提交成功的视频一级评论触发，预览、跳过和跟进回复不触发。结合人设和视频内容生成一句随手分享的感想，再附上链接；同一视频对同一群只尝试分享一次，失败或结果未知不会自动重发。",
+            "hint": "默认留空，不分享。每项填写一个麦麦已加入的 QQ 群号，最多 10 个。仅实际提交成功的视频一级评论触发，预览、跳过和跟进回复不触发。发送分享感想和视频链接。同一视频对同一群只尝试分享一次，失败或结果未知不会自动重发。",
             "placeholder": "例如：123456789",
         },
     )

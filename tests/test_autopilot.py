@@ -336,6 +336,39 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.client.understand.assert_not_awaited()
         self.assertEqual(await self.engine.next_check_delay(), 1800)
 
+    async def test_browse_prompt_uses_configured_selection_limit_with_more_candidates(self):
+        candidates = [replace(ITEM, bvid=f"BV{n:010d}") for n in range(5)]
+        stats = self.store.stats(self.client.uid, 0)
+        for limit in (1, 3, 4):
+            self.cfg.browse.videos_per_round = limit
+            self.now += 7200
+            self.generate.return_value = json.dumps({
+                "should_browse": True, "reason": "看看有兴趣的视频", "next_check_minutes": 30,
+                "selected_bvids": [item.bvid for item in candidates[:limit]],
+            })
+            self.assertTrue(await self.engine._want_to_browse(self.client.uid, self.cfg, stats, "好奇", candidates))
+            prompt = self.generate.call_args.args[0]
+            self.assertIn(f"最多 {limit} 条", prompt[0]["content"])
+            self.assertEqual(len(self.engine._selected_bvids), limit)
+
+    async def test_excess_selection_records_specific_reason_without_browsing(self):
+        self.cfg.browse.autonomous_enabled = True
+        candidates = [replace(ITEM, bvid=f"BV{n:010d}") for n in range(4)]
+        self.client.recommended.return_value = candidates
+        self.generate.return_value = json.dumps({
+            "should_browse": True, "reason": "看看有兴趣的视频", "next_check_minutes": 30,
+            "selected_bvids": [item.bvid for item in candidates],
+        })
+        await self.engine.start()
+        with self.assertLogs("local_bilibili_autopilot.engine", level="WARNING") as logs:
+            result = await self.engine.round()
+        self.assertIn("选择了 4 条，最多允许 3 条", result)
+        self.assertIn("选择了 4 条", logs.output[0])
+        self.assertNotIn(candidates[0].bvid, logs.output[0])
+        self.assertIn("选择超限", self.store.latest_browse_decision(self.client.uid)["reason"])
+        self.client.understand.assert_not_awaited()
+        self.client.publish.assert_not_awaited()
+
     async def test_first_login_auto_starts_without_command(self):
         self.cfg.browse.autonomous_enabled = True
         self.assertIn("自主模式", await self.engine.start(automatic=True))

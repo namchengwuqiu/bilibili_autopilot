@@ -1,5 +1,7 @@
 from pathlib import Path
+from dataclasses import replace
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import asyncio
@@ -8,6 +10,7 @@ import unittest
 
 from local_bilibili_autopilot.config import AutopilotConfig
 from local_bilibili_autopilot.models import DecisionValidationError, ModelTimeoutError, VideoItem, parse_share_text, share_prompt
+from local_bilibili_autopilot.plugin import BilibiliAutopilotPlugin
 from local_bilibili_autopilot.sharing import VideoSharer
 from local_bilibili_autopilot.state import StateStore
 from local_bilibili_autopilot.webui import record_row
@@ -18,6 +21,7 @@ GROUP = "123456789"
 STREAM = {"session_id": "real-session", "platform": "qq", "group_id": GROUP,
           "chat_type": "group", "account_id": "test-bot", "group_name": "测试群"}
 INTRO = "这段旋律一变，角色那股劲儿就出来了"
+CARD = {"app": "com.tencent.miniapp_01", "meta": {"detail_1": {"desc": ITEM.title, "title": "哔哩哔哩"}}}
 
 
 class SharingTests(unittest.IsolatedAsyncioTestCase):
@@ -48,6 +52,200 @@ class SharingTests(unittest.IsolatedAsyncioTestCase):
         self.chat.get_group_streams.assert_not_awaited()
         self.send.text.assert_not_awaited()
         self.compose.assert_not_awaited()
+
+    def enable_card(self):
+        self.cfg.share.miniapp_enabled = True
+        self.sharer.compose_card = AsyncMock(return_value=json.dumps(CARD, ensure_ascii=False))
+        self.send.custom.return_value = {"sent": True, "message_id": "card-1"}
+
+    async def test_card_is_confirmed_and_saved_before_standalone_intro(self):
+        self.enable_card(); self.comment_sent()
+        order = []
+        async def card(*args, **kwargs):
+            order.append("card")
+            return {"sent": True, "message_id": "card-1"}
+        async def intro(*args, **kwargs):
+            order.append("intro")
+            row = self.store.latest_share("1")
+            self.assertEqual((row["card_sent"], row["card_message_id"]), (1, "card-1"))
+            self.assertEqual(row["status"], "pending")
+            return {"sent": True, "message_id": "intro-1"}
+        self.send.custom.side_effect, self.send.text.side_effect = card, intro
+        self.assertIn("已分享至群聊", await self.sharer.share("1", ITEM))
+        self.assertEqual(order, ["card", "intro"])
+        self.send.custom.assert_awaited_once_with("json", json.dumps(CARD, ensure_ascii=False), "real-session",
+                                                return_details=True, processed_plain_text=f"[B站小程序] {ITEM.title}")
+        self.send.text.assert_awaited_once_with(INTRO, "real-session", return_details=True)
+        row = self.store.latest_share("1")
+        self.assertEqual(row["message_id"], "intro-1")
+        self.assertIn("小程序卡片已发送", record_row(row, "shares", "Asia/Shanghai")["reason"])
+        self.assertEqual(self.store.share_context("1", ITEM.bvid)["recent_shares"], [INTRO])
+        self.store.initialize()
+        await self.sharer.share("1", ITEM)
+        self.assertEqual(order, ["card", "intro"])
+
+    async def test_failed_or_unknown_card_never_sends_intro_or_retries(self):
+        self.enable_card(); self.comment_sent()
+        self.send.custom.return_value = {"sent": False}
+        self.assertIn("未发送分享感想", await self.sharer.share("1", ITEM))
+        self.assertEqual(self.store.latest_share("1")["status"], "failed")
+        await self.sharer.share("1", ITEM)
+        self.send.custom.assert_awaited_once()
+        self.send.text.assert_not_awaited()
+
+    async def test_unknown_card_stops_before_intro(self):
+        self.enable_card(); self.comment_sent()
+        self.send.custom.return_value = {"unexpected": True}
+        self.assertIn("结果待核对", await self.sharer.share("1", ITEM))
+        self.send.text.assert_not_awaited()
+        self.assertEqual(self.store.latest_share("1")["status"], "unknown")
+
+    async def test_card_timeout_stops_before_intro(self):
+        self.enable_card(); self.comment_sent()
+        self.send.custom.side_effect = asyncio.TimeoutError()
+        await self.sharer.share("1", ITEM)
+        self.send.text.assert_not_awaited()
+        self.assertEqual(self.store.latest_share("1")["status"], "unknown")
+
+    async def test_intro_failure_keeps_card_receipt_and_is_not_replayed(self):
+        self.enable_card(); self.comment_sent()
+        self.send.text.return_value = {"sent": False}
+        self.assertIn("仅小程序卡片已发送", await self.sharer.share("1", ITEM))
+        row = self.store.latest_share("1")
+        self.assertEqual((row["status"], row["card_message_id"], row["message_id"]), ("partial", "card-1", "card-1"))
+        self.store.initialize()
+        await self.sharer.share("1", ITEM)
+        self.send.custom.assert_awaited_once()
+        self.send.text.assert_awaited_once()
+
+    async def test_intro_timeout_keeps_card_receipt_as_unknown(self):
+        self.enable_card(); self.comment_sent()
+        self.send.text.side_effect = asyncio.TimeoutError()
+        self.assertIn("小程序卡片已发送", await self.sharer.share("1", ITEM))
+        row = self.store.latest_share("1")
+        self.assertEqual((row["status"], row["card_sent"]), ("unknown", 1))
+        await self.sharer.share("1", ITEM)
+        self.send.custom.assert_awaited_once()
+        self.send.text.assert_awaited_once()
+
+    async def test_pause_after_card_stops_intro(self):
+        self.enable_card(); self.comment_sent()
+        async def pause(*args, **kwargs):
+            self.allowed = False
+            return {"sent": True, "message_id": "card-1"}
+        self.send.custom.side_effect = pause
+        await self.sharer.share("1", ITEM)
+        self.send.text.assert_not_awaited()
+        self.assertEqual(self.store.latest_share("1")["status"], "partial")
+
+    async def test_config_change_after_card_stops_intro(self):
+        self.enable_card(); self.comment_sent()
+        async def change(*args, **kwargs):
+            self.cfg.share.qq_group_ids = []
+            return {"sent": True, "message_id": "card-1"}
+        self.send.custom.side_effect = change
+        await self.sharer.share("1", ITEM)
+        self.send.text.assert_not_awaited()
+        self.assertEqual(self.store.latest_share("1")["status"], "partial")
+
+    async def test_interruption_after_card_retains_receipt_without_replay(self):
+        self.enable_card(); self.comment_sent()
+        self.send.text.side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.sharer.share("1", ITEM)
+        self.store.initialize()
+        row = self.store.latest_share("1")
+        self.assertEqual((row["status"], row["card_message_id"]), ("unknown", "card-1"))
+        self.assertIn("卡片已发送", row["detail"])
+        await self.sharer.share("1", ITEM)
+        self.send.custom.assert_awaited_once()
+
+    async def test_card_generation_failure_never_sends_messages(self):
+        self.enable_card(); self.comment_sent()
+        self.sharer.compose_card.side_effect = ValueError("bad card")
+        self.assertIn("小程序卡片生成失败", await self.sharer.share("1", ITEM))
+        self.send.custom.assert_not_awaited()
+        self.send.text.assert_not_awaited()
+
+    async def test_multiple_groups_receive_card_then_intro_with_one_draft(self):
+        self.enable_card(); self.comment_sent()
+        self.cfg.share.qq_group_ids.append("123456")
+        self.chat.get_group_streams.return_value = [STREAM, {**STREAM, "group_id": "123456", "session_id": "second"}]
+        order = []
+        async def card(kind, data, stream, **kwargs):
+            order.append((stream, "card"))
+            return {"sent": True, "message_id": f"card-{stream}"}
+        async def intro(text, stream, **kwargs):
+            order.append((stream, "intro"))
+            return {"sent": True, "message_id": f"intro-{stream}"}
+        self.send.custom.side_effect, self.send.text.side_effect = card, intro
+        await self.sharer.share("1", ITEM)
+        self.assertEqual(order, [("real-session", "card"), ("real-session", "intro"),
+                                 ("second", "card"), ("second", "intro")])
+        self.compose.assert_awaited_once()
+        self.sharer.compose_card.assert_awaited_once()
+
+    def test_legacy_share_schema_upgrade_preserves_existing_record(self):
+        legacy = StateStore(Path(self.temp.name) / "legacy.sqlite3")
+        with legacy.connect() as db:
+            db.execute("CREATE TABLE video_shares (uid TEXT,bvid TEXT,group_id TEXT,ts REAL,title TEXT,status TEXT,"
+                       "detail TEXT DEFAULT '',message_id TEXT DEFAULT '',PRIMARY KEY(uid,bvid,group_id))")
+            db.execute("INSERT INTO video_shares VALUES (?,?,?,?,?,'sent',?,?)",
+                       ("1", ITEM.bvid, GROUP, 900, ITEM.title, f"分享文案：{INTRO}", "old-message"))
+        legacy.initialize()
+        legacy.initialize()
+        row = legacy.latest_share("1")
+        self.assertEqual((row["status"], row["message_id"], row["detail"]), ("sent", "old-message", f"分享文案：{INTRO}"))
+        self.assertEqual((row["card_sent"], row["card_message_id"]), (0, ""))
+
+    async def test_documented_snowluma_and_napcat_card_responses(self):
+        plugin = BilibiliAutopilotPlugin()
+        item = replace(ITEM, cover="https://i0.hdslb.com/bfs/archive/cover.jpg")
+        api = AsyncMock()
+        plugin._ctx = SimpleNamespace(api=api)
+        expected = {**CARD, "meta": {"detail_1": {**CARD["meta"]["detail_1"],
+                    "qqdocurl": f"https://www.bilibili.com/video/{ITEM.bvid}", "scene": 1036}}}
+        for data in (CARD, {"ark": json.dumps(CARD)}):
+            api.call.return_value = {"status": "ok", "retcode": 0, "data": {"data": data}}
+            self.assertEqual(json.loads(await plugin._compose_card(item)), expected)
+        api.call.assert_awaited_with("adapter.napcat.account.get_mini_app_ark", version="1",
+                                    params={"type": "bili", "title": "哔哩哔哩", "desc": ITEM.title,
+                                            "picUrl": item.cover, "jumpUrl": f"https://www.bilibili.com/video/{ITEM.bvid}"})
+        for response in ({"status": "failed", "retcode": 1}, {"status": "ok", "retcode": 0, "data": {}},
+                         {"status": "ok", "retcode": 0, "data": {"data": {"app": "other", "meta": {}}}},
+                         {"status": "ok", "retcode": 0, "data": {"data": {"app": "com.tencent.miniapp_01", "meta": {"detail_1": []}}}}):
+            api.call.return_value = response
+            with self.assertRaises(ValueError):
+                await plugin._compose_card(item)
+
+    async def test_card_web_target_patch_preserves_native_address_and_signature(self):
+        plugin = BilibiliAutopilotPlugin()
+        item = replace(ITEM, cover="https://i0.hdslb.com/bfs/archive/cover.jpg")
+        card = {**CARD, "config": {"token": "original-signature", "ctime": 1000},
+                "miniappShareOrigin": 3, "miniappOpenRefer": "10002",
+                "meta": {"detail_1": {**CARD["meta"]["detail_1"], "appid": "1109937557", "scene": 0,
+                                      "qqdocurl": "", "url": "m.q.qq.com/a/s/original-native-address"}}}
+        original = json.loads(json.dumps(card))
+        api = AsyncMock()
+        api.call.return_value = {"status": "ok", "retcode": 0, "data": {"data": card}}
+        plugin._ctx = SimpleNamespace(api=api)
+        patched = json.loads(await plugin._compose_card(item))
+        expected = json.loads(json.dumps(original))
+        expected["meta"]["detail_1"].update(qqdocurl=f"https://www.bilibili.com/video/{ITEM.bvid}", scene=1036)
+        self.assertEqual(patched, expected)
+        self.assertEqual(card, original)
+        self.assertNotIn("verType", patched["meta"]["detail_1"])
+        self.assertNotIn("versionId", patched["meta"]["detail_1"])
+
+    async def test_card_preserves_existing_web_target_and_nonzero_scene(self):
+        plugin = BilibiliAutopilotPlugin()
+        item = replace(ITEM, cover="https://i0.hdslb.com/bfs/archive/cover.jpg")
+        card = {**CARD, "meta": {"detail_1": {**CARD["meta"]["detail_1"], "scene": 1037,
+                                             "qqdocurl": "https://b23.tv/original-share"}}}
+        api = AsyncMock()
+        api.call.return_value = {"status": "ok", "retcode": 0, "data": {"data": {"ark": json.dumps(card)}}}
+        plugin._ctx = SimpleNamespace(api=api)
+        self.assertEqual(json.loads(await plugin._compose_card(item)), card)
 
     async def test_success_uses_real_existing_group_and_deduplicates_after_restart(self):
         self.comment_sent()

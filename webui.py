@@ -47,6 +47,8 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
         result.update(title=row['title'],bvid=row['bvid'],url='https://www.bilibili.com/video/'+row['bvid'],
                       outcome=SHARE_OUTCOMES.get(row['status'],row['status']),mode='评论后群分享',
                       reason=f"QQ 群 {row['group_id']}；{row['detail']}",rpid=row['message_id'])
+        if row.get('card_sent'):
+            result['reason'] = f"QQ 群 {row['group_id']}；小程序卡片已发送（消息 ID：{row.get('card_message_id') or '未返回'}）；{row['detail']}"
         result['summary'] = result['reason'][:100]
         return result
     if kind in {'replies','reply_attempts'}:

@@ -6,13 +6,16 @@ from typing import Any, Dict, Optional
 import asyncio
 import base64
 import contextlib
+import json
 import re
 import time
 
 import httpx
 
-from maibot_sdk import API, Command, MaiBotPlugin
+from maibot_sdk import API, Command, HookHandler, MaiBotPlugin, Tool
+from maibot_sdk.types import HookMode, HookOrder
 
+from .activity import HistoryHandoff, is_activity_question, query_activity, reply_message_key
 from .client import BiliClient, LoginRequired, PlatformError
 from .config import AutopilotConfig
 from .engine import Autopilot, ReadWaiting
@@ -62,6 +65,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         self._job_action = ""
         self._last_operation = "尚未执行页面或聊天指令"
         self._last_operation_ok = True
+        self._history_handoff = HistoryHandoff()
 
     async def on_load(self) -> None:
         data_dir = Path(self.ctx.paths.data_dir)
@@ -77,6 +81,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             self.ctx.send,
             self.engine.may_publish,
             self._compose_share,
+            compose_card=self._compose_card,
         )
         self.engine.share_video = self.sharer.share
         self._share_targets = await self.sharer.targets_summary()
@@ -88,6 +93,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         self.ctx.logger.info("B站自主浏览插件已加载；publish_enabled=%s", self.config.comment.publish_enabled)
 
     async def on_unload(self) -> None:
+        self._history_handoff.turns.clear()
         # 保留用户的启停选择；取消发布中的任务会留下 pending，重启后要求核对。
         for task in (self._scheduler, self._job):
             if task is not None:
@@ -104,9 +110,101 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         if self.sharer is not None:
             self._share_targets = await self.sharer.targets_summary()
         if self.engine is not None and not self.config.plugin.enabled:
+            self._history_handoff.turns.clear()
             if not self.engine.paused or self.engine.pause_kind in {"initial", "login", "disabled"}:
                 await self.engine.pause("已在配置中禁用", kind="disabled")
         self._wake.set()
+
+    @HookHandler("maisaka.planner.before_request", mode=HookMode.BLOCKING)
+    async def track_history_turn(self, **kwargs: Any) -> Dict[str, Any]:
+        if self.config.plugin.enabled:
+            session = str(kwargs.get("session_id") or "")
+            self._history_handoff.observe(session, kwargs.get("items"))
+            turn = self._history_handoff.turns.get(session)
+            self.ctx.logger.debug("B站历史交接：规划绑定 session=%s anchor=%s", session, turn.anchor if turn else "无")
+        return {"action": "continue"}
+
+    @HookHandler("maisaka.replyer.before_request", mode=HookMode.BLOCKING, order=HookOrder.LATE)
+    async def inject_history_facts(self, **kwargs: Any) -> Dict[str, Any]:
+        if not self.config.plugin.enabled or self.client is None or not self.client.uid:
+            self._history_handoff.turns.clear()
+            return {"action": "continue"}
+        session = str(kwargs.get("session_id") or "")
+        message_id = str(kwargs.get("reply_message_id") or "")
+        prompt = self._history_handoff.prompt(session, message_id, self.client.uid)
+        turn = self._history_handoff.turns.get(session)
+        if (not prompt and self.engine is not None and turn is not None
+                and turn.revision == 0 and turn.anchor == reply_message_key(message_id)
+                and is_activity_question(turn.question)):
+            # Planner 可能复用上下文里的旧查询而不再调用工具。回复前补一次只读本地查询，
+            # 避免只交接“本轮刚执行工具”的结果；不请求 B 站，也不额外调用模型。
+            uid = self.client.uid
+            token = self._history_handoff.begin(session)
+            result = await asyncio.to_thread(
+                query_activity, self.engine.store, uid, now=self.engine.clock(),
+                timezone=self.config.browse.timezone, days=1 if re.search(r"今天|刚才|刚刚", turn.question) else 7,
+            )
+            if self.client.uid == uid and self.config.plugin.enabled:
+                self._history_handoff.remember(session, token, uid, result)
+                prompt = self._history_handoff.prompt(session, message_id, uid)
+                self.ctx.logger.info("B站历史交接：回复前已刷新本地记录 records=%s", len(result["records"]))
+        if not prompt:
+            turn = self._history_handoff.turns.get(session)
+            self.ctx.logger.debug(
+                "B站历史交接：回复未匹配 session=%s target=%s anchor=%s cached=%s",
+                session, kwargs.get("reply_message_id"), turn.anchor if turn else "无", bool(turn and turn.prompt),
+            )
+            return {"action": "continue"}
+        extra = str(kwargs.get("extra_prompt") or "")
+        if prompt not in extra:
+            kwargs["extra_prompt"] = extra + prompt
+            self.ctx.logger.info("B站活动查询事实已交给回复模型（当前会话与目标消息匹配）")
+        return {"action": "continue", "modified_kwargs": kwargs}
+
+    @Tool(
+        "bilibili_autopilot_history",
+        brief_description="查询麦麦自己在 B 站刷过什么视频、发过什么评论及跟进回复",
+        detailed_description=(
+            "当用户问你最近在 B 站/bilibili 刷了什么、看了什么、评论了什么、回复了谁，"
+            "或回忆自己刷 B 站的经历时，先用本工具查真实记录再回答。"
+            "包括后台自主浏览；不要因为当前聊天没有记录就回答不知道。"
+            "这是只读查询，不会刷视频或发评论。"
+            "query 用简短标题关键词、UP 主名、评论关键词或 BV 号，不要填整句问题。"
+            "最近浏览用 browse，已写的评论用 comments，跟进用 replies，综合用 all。"
+            "默认查最近7天；需要更早记录可增大 days，0 表示全部历史。"
+            "区分已发送、预览草稿、失败与未知结果，只按返回事实自然回答。"
+        ),
+        parameters={
+            "query": {"type": "string", "description": "关键词或 BV 号；留空查询最近记录", "default": ""},
+            "kind": {"type": "string", "enum": ["all", "browse", "comments", "replies"], "default": "all"},
+            "days": {"type": "integer", "minimum": 0, "maximum": 3650, "default": 7,
+                     "description": "最近多少天，0 表示不限时间"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
+        },
+    )
+    async def tool_history(
+        self, query: str = "", kind: str = "all", days: int = 7, limit: int = 8, **kwargs: Any
+    ) -> Dict[str, Any]:
+        session = str(kwargs.get("stream_id") or "")
+        token = self._history_handoff.begin(session)
+        if not self.config.plugin.enabled:
+            return {"success": False, "content": "B站自主浏览插件已禁用，无法查询活动记录。"}
+        if self.engine is None or self.client is None or not self.client.uid:
+            return {"success": False, "content": "B站插件尚未初始化或未登录，无法确定要查询的账号。"}
+        uid = self.client.uid
+        try:
+            result = await asyncio.to_thread(
+                query_activity, self.engine.store, uid, now=self.engine.clock(), timezone=self.config.browse.timezone,
+                query=query, kind=kind, days=days, limit=limit,
+            )
+        except ValueError as exc:
+            return {"success": False, "content": str(exc)}
+        if self.client.uid != uid or not self.config.plugin.enabled:
+            return {"success": False, "content": "查询期间账号或插件状态发生变化，请重新查询。"}
+        self._history_handoff.remember(session, token, uid, result)
+        self.ctx.logger.info("B站历史交接：查询完成 session=%s bound=%s records=%s",
+                             session or "无", token is not None, len(result["records"]))
+        return {"success": True, "content": json.dumps(result, ensure_ascii=False)}
 
     async def _persona(self) -> str:
         profile = await self.ctx.config.get("personality", {})
@@ -189,6 +287,38 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         if response_error is not None:
             raise ModelResponseError(f"候选模型未返回有效正文：{response_error}；本次跳过，后续有限重查")
         raise ModelTimeoutError("候选模型均超时，本次跳过；自动运行保持开启，下轮继续")
+
+    async def _compose_card(self, item: VideoItem) -> str:
+        if not item.cover.startswith(("https://", "http://")):
+            raise ValueError("视频缺少有效封面，无法生成小程序卡片")
+        video_url = f"https://www.bilibili.com/video/{item.bvid}"
+        response = await self.ctx.api.call(
+            "adapter.napcat.account.get_mini_app_ark", version="1",
+            params={"type": "bili", "title": "哔哩哔哩", "desc": item.title,
+                    "picUrl": item.cover, "jumpUrl": video_url},
+        )
+        if not isinstance(response, dict) or response.get("status") != "ok" or response.get("retcode") != 0:
+            raise ValueError("QQ 服务未成功生成小程序卡片")
+        data = response.get("data")
+        card = data.get("data") if isinstance(data, dict) else None
+        if isinstance(card, dict) and "ark" in card:
+            card = card["ark"]
+        if isinstance(card, str):
+            card = json.loads(card)
+        if not isinstance(card, dict) or card.get("app") != "com.tencent.miniapp_01" or not card.get("meta"):
+            raise ValueError("QQ 服务返回的小程序卡片格式无效")
+        meta = card["meta"]
+        detail = meta.get("detail_1") if isinstance(meta, dict) else None
+        if not isinstance(detail, dict):
+            raise ValueError("QQ 服务返回的小程序卡片详情格式无效")
+        # 对照正常 B 站分享补网页目标和场景；保留服务端签名、原生地址及已有有效字段。
+        detail = dict(detail)
+        if not detail.get("qqdocurl"):
+            detail["qqdocurl"] = video_url
+        if detail.get("scene") in (None, 0):
+            detail["scene"] = 1036
+        card = {**card, "meta": {**meta, "detail_1": detail}}
+        return json.dumps(card, ensure_ascii=False, allow_nan=False)
 
     async def _compose_share(self, uid: str, item: VideoItem, cfg: AutopilotConfig) -> str:
         assert self.engine is not None

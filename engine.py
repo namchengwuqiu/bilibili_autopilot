@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import asyncio
 import json
+import logging
 import math
 import time
 
@@ -495,6 +496,7 @@ class Autopilot:
             recent=recent,
             candidates=candidates,
             explore_more=cfg.browse.explore_more,
+            limit=cfg.browse.videos_per_round,
         )
         try:
             raw = await self._generate_model(prompt, cfg)
@@ -521,10 +523,12 @@ class Autopilot:
             decision = parse_browse_decision(
                 raw, min_minutes, cfg.browse.max_check_minutes, candidates, cfg.browse.videos_per_round
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
             # 格式不完整时不擅自去浏览；下次检查时重新判断，不自动修补模型原文。
             now = self.clock()
-            reason = "自主浏览判断格式无效，本次不浏览，下次检查时重试"
+            detail = "JSON 格式无效" if isinstance(exc, json.JSONDecodeError) else str(exc)[:100]
+            reason = f"自主浏览判断格式无效：{detail}；本次不浏览，下次检查时重试"
+            logging.getLogger(__name__).warning("%s", reason)
             await asyncio.to_thread(
                 self.store.record_browse_decision, uid, now, False, reason, now + cfg.browse.interval_seconds
             )

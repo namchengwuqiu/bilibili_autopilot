@@ -116,6 +116,13 @@ class StateStore:
             columns = {row["name"] for row in db.execute("PRAGMA table_info(browse_decisions)")}
             if "selected_bvids" not in columns:
                 db.execute("ALTER TABLE browse_decisions ADD COLUMN selected_bvids TEXT NOT NULL DEFAULT '[]'")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(video_shares)")}
+            for column, declaration in (
+                ("card_sent", "INTEGER NOT NULL DEFAULT 0"),
+                ("card_message_id", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE video_shares ADD COLUMN {column} {declaration}")
             for table in ("visits", "reply_decisions"):
                 columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
                 for column, declaration in (
@@ -210,7 +217,9 @@ class StateStore:
             )
             self._recover_interrupted(db, now)
             db.execute(
-                "UPDATE video_shares SET status='unknown',detail='进程中断，群分享结果待核对；不会自动重发' WHERE status='pending'"
+                "UPDATE video_shares SET status='unknown',detail=CASE WHEN card_sent=1 "
+                "THEN '进程中断，卡片已发送，分享感想结果待核对；不会自动重发' "
+                "ELSE '进程中断，群分享结果待核对；不会自动重发' END WHERE status='pending'"
             )
         self.path.chmod(0o600)
 
@@ -278,6 +287,15 @@ class StateStore:
         with self.connect() as db:
             row = db.execute("SELECT * FROM video_shares WHERE uid=? ORDER BY ts DESC LIMIT 1", (uid,)).fetchone()
             return dict(row) if row else None
+
+    def mark_share_card_sent(self, uid: str, bvid: str, group_id: str, message_id: str) -> None:
+        """卡片确认后立即落盘，第二条消息中断也保留已成功的第一步。"""
+        with self.connect() as db:
+            db.execute(
+                "UPDATE video_shares SET card_sent=1,card_message_id=?,message_id=?,"
+                "detail='卡片已发送，等待发送分享感想' WHERE uid=? AND bvid=? AND group_id=? AND status='pending'",
+                (message_id, message_id, uid, bvid, group_id),
+            )
 
     def share_context(self, uid: str, bvid: str) -> Dict[str, Any]:
         with self.connect() as db:
