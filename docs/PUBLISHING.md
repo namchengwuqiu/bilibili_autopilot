@@ -7,21 +7,21 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`；当前版本：`0.8.3`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本：`0.6.0`；当前版本：`0.8.4`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
 1. 在公开仓库默认分支的根目录提交源码和资源，确保 `_manifest.json`、`plugin.py`、`README.md`、`LICENSE` 都位于根目录。
-2. 运行 `python scripts/validate_release.py --tag v0.8.3`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
+2. 运行 `python scripts/validate_release.py --tag v0.8.4`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
 3. 确认源码仓库不包含 `config.toml`、`config_back/`、登录凭据、二维码、数据库及运行数据。默认示例仅使用 `config.example.toml`。
-4. 创建并推送 `v0.8.3` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
+4. 创建并推送 `v0.8.4` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
 5. 确认 Release 已公开发布，随后按 [市场登记文案](MARKETPLACE_SUBMISSION.md) 在插件中心创建新增插件 Issue。
 6. 等待市场验证、同步及审核收录。只有仓库代码或 Tag 不满足首次登记要求，草稿 Release 也不满足要求。
 
 手动生成用于检查的发布附件：
 
 ```sh
-python scripts/validate_release.py --tag v0.8.3 \
+python scripts/validate_release.py --tag v0.8.4 \
   --archive dist/bilibili-autopilot.zip --notes dist/release-notes.md
 ```
 
@@ -87,3 +87,13 @@ ZIP 根目录直接包含插件文件，不套多层目录。脚本使用固定�
 确认主程序已启用 `bilibili_autopilot_history` 后，可问“查询你最近在 B 站浏览和评论的记录”。旧记录可以直接查询；事实摘要按会话和目标消息交给回复模型，明确的 B 站活动问题在未重新调用工具时也会补查本地记录。查询无需重新登录，不额外请求 B 站或调用模型，不写入通用记忆库。仍需按记录区分已发送、预览和结果未知。
 
 完整隔离测试 278 项，277 项通过、1 项可选网络库测试跳过；真实 QQ 对话验证了自动补查和事实交接，评论状态边界通过离线模型回放验证。公开安装包由固定公共文件清单构建，不含部署配置、账号数据或日志。
+
+## 0.8.4 升级与验证
+
+修复市场新版本拒收：省略可选的 `host_application.max_version`，不再使用市场禁止的 `999.999.999`。保留 MaiBot 最低版本 `1.3.10` 与 SDK 范围；未声明上限不代表所有未来主程序版本均已验证兼容。
+
+发布校验同步检查插件版本及主程序兼容版本格式、第一位和第二位的 `99` / `999` 限制，以及主程序版本范围顺序，防止同类错误再次发版。SDK 版本不套用这项市场限制。
+
+本版包含 0.8.0 和 0.8.3 的全部功能与修复；这两个旧 Release 曾因不合规上限被市场拒收。使用新版本重新进入市场同步审核，不移动旧 Tag 或改写旧 Release。市场收录结果以版本索引和审核状态为准。
+
+保留现有配置、登录态与最新状态库更新即可；本版仅调整发布元数据、说明和校验，不修改业务逻辑、配置格式或数据库结构，不补发历史评论与分享。

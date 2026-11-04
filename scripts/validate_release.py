@@ -34,6 +34,22 @@ def validate(root: Path, tag: str | None) -> tuple[str, str]:
     version = manifest["version"]
     if re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", version) is None:
         raise ValueError("版本号必须是 X.Y.Z")
+    host = manifest["host_application"]
+    checked_versions = {"version": version, "host_application.min_version": host["min_version"]}
+    if "max_version" in host:
+        checked_versions["host_application.max_version"] = host["max_version"]
+    parsed_versions = {}
+    for field, value in checked_versions.items():
+        pattern = r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+        if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+            raise ValueError(f"{field} 必须是 X.Y.Z")
+        parts = tuple(int(part) for part in value.split("."))
+        if any(part in {99, 999} for part in parts[:2]):
+            raise ValueError(f"{field} 第一位和第二位不能填写 99 或 999")
+        parsed_versions[field] = parts
+    if ("max_version" in host
+            and parsed_versions["host_application.max_version"] < parsed_versions["host_application.min_version"]):
+        raise ValueError("host_application.max_version 不能小于 min_version")
     if tag is not None and tag not in {version, f"v{version}"}:
         raise ValueError("Tag 必须是 manifest 的 X.Y.Z 或 vX.Y.Z")
     repo = manifest["urls"]["repository"]
