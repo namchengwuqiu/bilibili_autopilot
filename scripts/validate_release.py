@@ -20,6 +20,7 @@ FILES = (
     "scripts/preview_shares.py", "scripts/run_tests.py", "scripts/validate_release.py",
     "tests/test_autopilot.py", "tests/test_client_plugin.py", "tests/test_recovery.py", "tests/test_replies.py",
     "tests/test_sharing.py", "tests/test_webui.py", "tests/test_handoff.py", "tests/test_candidates.py", "tests/test_activity.py",
+    "tests/test_login_diagnostics.py",
 )
 
 

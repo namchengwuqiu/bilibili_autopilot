@@ -7,21 +7,21 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`；当前版本：`0.8.5`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本：`0.6.0`；当前版本：`0.8.6`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
 1. 在公开仓库默认分支的根目录提交源码和资源，确保 `_manifest.json`、`plugin.py`、`README.md`、`LICENSE` 都位于根目录。
-2. 运行 `python scripts/validate_release.py --tag v0.8.5`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
+2. 运行 `python scripts/validate_release.py --tag v0.8.6`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
 3. 确认源码仓库不包含 `config.toml`、`config_back/`、登录凭据、二维码、数据库及运行数据。默认示例仅使用 `config.example.toml`。
-4. 创建并推送 `v0.8.5` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
+4. 创建并推送 `v0.8.6` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
 5. 确认 Release 已公开发布，随后按 [市场登记文案](MARKETPLACE_SUBMISSION.md) 在插件中心创建新增插件 Issue。
 6. 等待市场验证、同步及审核收录。只有仓库代码或 Tag 不满足首次登记要求，草稿 Release 也不满足要求。
 
 手动生成用于检查的发布附件：
 
 ```sh
-python scripts/validate_release.py --tag v0.8.5 \
+python scripts/validate_release.py --tag v0.8.6 \
   --archive dist/bilibili-autopilot.zip --notes dist/release-notes.md
 ```
 
@@ -105,3 +105,11 @@ ZIP 根目录直接包含插件文件，不套多层目录。脚本使用固定�
 发布前除运行插件隔离测试、打包及市场版本规则检查外，使用本地 Docker 中的真实宿主 ManifestValidator 校验，确认无强制兼容放行也能通过。未来扩展主程序支持范围应先验证再更新上限，不使用 `99` / `999` 占位版本。
 
 升级保留配置、凭据和最新状态库；本版不修改业务逻辑或数据结构。旧 Tag 和 Release 不改写，发布新版本修复。
+
+## 0.8.6 升级与验证
+
+增加扫码登录阶段日志和脱敏异常摘要，用于定位扫码确认后发生的 SSL 失败。更新并重载后重新扫码一次，提供本次 `B站登录诊断` 的日志和管理页错误摘要。市场尚未同步时使用 GitHub Release ZIP；保留配置、登录凭据和最新状态库。无需清空历史或卸载依赖。
+
+隔离测试模拟扫码状态转换、验证失败、SSL 异常链及文件保存失败，检查日志和管理页摘要不泄露请求、凭据或路径；可选 curl_cffi 安装时使用真实异常类型验证数值错误码。发布前继续使用真实宿主校验清单并检查本地加载。反馈者 Windows 环境的具体 SSL 根因需等待新版复测日志确认。
+
+本版隔离测试 290 项：安装 curl_cffi 时全部通过；未安装时 288 项通过、2 项可选测试跳过。真实 MaiBot 1.3.19 的 ManifestValidator 在未强制放行兼容性时通过校验。

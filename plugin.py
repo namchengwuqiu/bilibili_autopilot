@@ -69,7 +69,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         data_dir = Path(self.ctx.paths.data_dir)
-        self.client = BiliClient(data_dir / "credential.json")
+        self.client = BiliClient(data_dir / "credential.json", logger=self.ctx.logger)
         self.engine = Autopilot(
             self.client, StateStore(data_dir / "state.sqlite3"), lambda: self.config, self._generate, self._persona
         )

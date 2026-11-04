@@ -1,6 +1,7 @@
 """B 站读取和单次评论发布。写请求不交给带自动重试的通用 API 包装器。"""
 
 from dataclasses import replace
+from importlib.metadata import PackageNotFoundError, version as package_version
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -9,10 +10,12 @@ from urllib.parse import urlsplit
 import asyncio
 import json
 import os
+import platform
+import re
 import tempfile
 import time
 
-from bilibili_api import Credential, comment, homepage, session, user, video
+from bilibili_api import Credential, comment, get_selected_client, homepage, session, user, video
 from bilibili_api.exceptions import NetworkException, ResponseCodeException
 from bilibili_api.utils.network import Api
 
@@ -33,6 +36,67 @@ else:
 
 class LoginRequired(Exception):
     pass
+
+
+class LoginDiagnosticError(LoginRequired):
+    """只包含可公开字段的登录失败摘要，不保留原始异常文本。"""
+
+
+def login_error_details(error: Exception) -> str:
+    """保留异常链的类型、数值错误码与已知 TLS 类别，绝不输出请求或任意错误文本。"""
+    hints = {
+        "certificate_verify_failed": ("certificate verify failed", "certificate_verify_failed",
+                                      "ssl certificate problem", "unable to get local issuer certificate"),
+        "ca_bundle_unreadable": ("error setting certificate verify locations", "ssl_cacert_badfile",
+                                 "could not find a suitable tls ca certificate bundle"),
+        "certificate_expired": ("certificate has expired", "certificate_expired"),
+        "self_signed_certificate": ("self signed certificate", "self-signed certificate"),
+        "hostname_mismatch": ("hostname mismatch", "doesn't match", "does not match"),
+        "wrong_tls_version": ("wrong_version_number", "wrong version number"),
+        "tls_handshake_failed": ("ssl_connect", "ssl connect error", "ssl handshake", "tls connect error",
+                                 "handshake_failure", "handshake failure"),
+    }
+    chain, seen, categories = [], set(), set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen and len(chain) < 4:
+        seen.add(id(current))
+        error_type = f"{type(current).__module__}.{type(current).__name__}"
+        fields = [f"error={error_type}"]
+        for name in ("code", "errno", "verify_code"):
+            value = getattr(current, name, None)
+            if isinstance(value, int) and not isinstance(value, bool) and -(2 ** 31) <= value < 2 ** 31:
+                fields.append(f"{name}={int(value)}")
+        message = str(current).lower()
+        categories.update(name for name, phrases in hints.items() if any(phrase in message for phrase in phrases))
+        chain.append(",".join(fields))
+        current = current.__cause__ or current.__context__
+    return " -> ".join(chain) + ("; tls=" + ",".join(sorted(categories)) if categories else "")
+
+
+def login_environment() -> str:
+    """仅输出版本与系统类型，不读取代理、证书路径或其他环境变量值。"""
+    def safe_version(value: str) -> str:
+        return value if re.fullmatch(r"[A-Za-z0-9.+_-]{1,80}", value) else "unknown"
+
+    try:
+        manifest = json.loads(Path(__file__).with_name("_manifest.json").read_text(encoding="utf-8"))
+        plugin_version = safe_version(manifest["version"])
+    except (OSError, ValueError, KeyError, TypeError):
+        plugin_version = "unknown"
+    fields = [f"plugin={plugin_version}", f"python={platform.python_version()}",
+              f"os={platform.system()}"]
+    for name in ("maibot-plugin-sdk", "bilibili-api-python", "curl_cffi", "aiohttp", "httpx", "certifi"):
+        try:
+            value = safe_version(package_version(name))
+        except PackageNotFoundError:
+            value = "not-installed"
+        fields.append(f"{name}={value}")
+    return "; ".join(fields)
+
+
+def login_api_client() -> str:
+    name = get_selected_client()[0]
+    return name if name in {"curl_cffi", "aiohttp", "httpx"} else "custom"
 
 
 class PlatformError(Exception):
@@ -131,8 +195,9 @@ def subtitle_url(raw: str) -> str:
 
 
 class BiliClient:
-    def __init__(self, credential_path: Path):
+    def __init__(self, credential_path: Path, logger: Any = None):
         self.credential_path = credential_path
+        self.logger = logger
         self.credential: Optional[Credential] = None
         self.uid = ""
         self.name = ""
@@ -186,16 +251,47 @@ class BiliClient:
         return self.uid
 
     async def begin_login(self) -> Tuple[bytes, str]:
-        response = await self.http.get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate")
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != 0:
-            raise PlatformError("生成登录二维码", int(payload.get("code", -1)))
-        data = payload["data"]
-        return await asyncio.to_thread(make_qr, data["url"]), data["qrcode_key"]
+        self._login_progress("生成二维码", "httpx", environment=True)
+        try:
+            response = await self.http.get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate")
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("code") != 0:
+                raise PlatformError("生成登录二维码", int(payload.get("code", -1)))
+            data = payload["data"]
+            png = await asyncio.to_thread(make_qr, data["url"])
+            self._login_progress("二维码已生成", "httpx")
+            return png, data["qrcode_key"]
+        except (LoginRequired, PlatformError):
+            raise
+        except Exception as exc:
+            raise self._login_failure("生成二维码", "httpx", exc) from None
+
+    def _login_progress(self, stage: str, client: str, environment: bool = False) -> None:
+        if self.logger is not None:
+            self.logger.info("B站登录诊断：stage=%s client=%s%s", stage, client,
+                             "; " + login_environment() if environment else "")
+
+    def _login_failure(self, stage: str, client: str, error: Exception) -> LoginDiagnosticError:
+        details = login_error_details(error)
+        if self.logger is not None:
+            self.logger.warning("B站登录诊断：stage=%s client=%s %s; %s",
+                                stage, client, details, login_environment())
+        return LoginDiagnosticError(f"扫码登录失败：阶段={stage}；客户端={client}；{details}。请提供本次“B站登录诊断”日志")
 
     async def poll_login(self, key: str) -> str:
+        stage, client = "轮询扫码状态", "httpx"
+        self._login_progress(stage, client)
+        try:
+            return await self._poll_login(key)
+        except (LoginRequired, PlatformError):
+            raise
+        except Exception as exc:
+            raise self._login_failure(stage, client, exc) from None
+
+    async def _poll_login(self, key: str) -> str:
         deadline = time.monotonic() + 180
+        previous_code = None
         while time.monotonic() < deadline:
             response = await self.http.get(
                 "https://passport.bilibili.com/x/passport-login/web/qrcode/poll", params={"qrcode_key": key}
@@ -213,20 +309,32 @@ class BiliClient:
                 if not all(cookies.get(k) for k in ("SESSDATA", "bili_jct", "DedeUserID")):
                     raise LoginRequired("扫码成功但缺少发布评论所需凭据，请重新登录")
                 credential = Credential.from_cookies(cookies)
+                client = login_api_client()
+                self._login_progress("验证扫码账号", client)
                 try:
                     info = await asyncio.wait_for(user.get_self_info(credential), timeout=30)
                 except ResponseCodeException as exc:
                     raise PlatformError("验证扫码账号", exc.code) from None
+                except Exception as exc:
+                    raise self._login_failure("验证扫码账号", client, exc) from None
                 record = {"cookies": cookies, "uid": str(info["mid"]), "name": str(info.get("name", ""))}
                 if record["uid"] != cookies["DedeUserID"]:
                     raise LoginRequired("扫码结果 UID 校验失败")
-                await asyncio.to_thread(write_private_json, self.credential_path, record)
-                self._use_credential(record)
+                self._login_progress("保存登录凭据", "local")
+                try:
+                    await asyncio.to_thread(write_private_json, self.credential_path, record)
+                    self._use_credential(record)
+                except Exception as exc:
+                    raise self._login_failure("保存登录凭据", "local", exc) from None
+                self._login_progress("登录完成", client)
                 return f"已登录 {self.name}（UID {self.uid}）"
             if code == 86038:
                 raise LoginRequired("二维码已过期，请重新使用 login")
             if code not in (86101, 86090):
                 raise PlatformError("扫码登录", int(code or -1))
+            if code != previous_code:
+                self._login_progress("已扫码，等待确认" if code == 86090 else "等待扫码", "httpx")
+                previous_code = code
             await asyncio.sleep(2)
         raise LoginRequired("扫码超时，请重新使用 login")
 

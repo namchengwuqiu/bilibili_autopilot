@@ -9,7 +9,7 @@
 | 插件 ID | `local.bilibili-autopilot` |
 | 插件名称 | B站自主浏览与评论 |
 | 仓库地址 | `https://github.com/namchengwuqiu/bilibili_autopilot` |
-| 当前版本 | `v0.8.5` |
+| 当前版本 | `v0.8.6` |
 | 作者 | sakura桜花 |
 | 许可证 | MIT |
 
