@@ -36,8 +36,9 @@ def validate(root: Path, tag: str | None) -> tuple[str, str]:
         raise ValueError("版本号必须是 X.Y.Z")
     host = manifest["host_application"]
     checked_versions = {"version": version, "host_application.min_version": host["min_version"]}
-    if "max_version" in host:
-        checked_versions["host_application.max_version"] = host["max_version"]
+    if "max_version" not in host:
+        raise ValueError("缺少 host_application.max_version：现有宿主加载要求显式声明兼容上限")
+    checked_versions["host_application.max_version"] = host["max_version"]
     parsed_versions = {}
     for field, value in checked_versions.items():
         pattern = r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
