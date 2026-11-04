@@ -186,23 +186,82 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.round()
         self.client.publish.assert_not_awaited()
 
-    async def test_unknown_result_pauses_and_does_not_retry(self):
-        self.engine.share_video = AsyncMock()
+    async def test_unknown_result_holds_posts_but_browsing_survives_restart_and_ack(self):
+        self.engine.share_video = AsyncMock(return_value="")
         self.client.publish.side_effect = UnknownPublish("timeout")
         await self.engine.start()
         result = await self.engine.round()
         self.assertIn("待核对", result)
-        self.assertTrue(self.engine.paused)
+        self.assertFalse(self.engine.paused)
         self.assertEqual(self.store.stats("1001", 0)["unresolved"], [ITEM.bvid])
+        await self.engine.initialize()
+        self.assertFalse(self.engine.paused)
         self.assertIn("待核对", await self.engine.start())
+        fresh = replace(ITEM, bvid="BV0987654321")
+        self.client.recommended.return_value = [ITEM, fresh]
+        self.client.understand.return_value = fresh, EVIDENCE
+        self.generate.return_value = decision(comment="")
+        self.now += 7200  # 超过发送冷却，单独验证待核对保护。
+        result = await self.engine.round()
+        self.assertIn("候选保留中", result)
+        self.assertIn("待核对", result)
+        self.assertFalse(self.engine.paused)
+        self.assertEqual(self.store.stats("1001", 0)["attempts"], 1)
+        self.assertEqual(len(self.store.candidates("1001", lambda item: True, self.now,
+                                                   24, ready_only=False)), 1)
+        with self.store.connect() as db:
+            detail = json.loads(db.execute("SELECT detail FROM visits WHERE bvid=? AND mode='publish'",
+                                           (fresh.bvid,)).fetchone()[0])
+        self.assertEqual(detail["comment"], "")
+        self.assertEqual(self.engine.review.await_count, 1)  # 仅首次发送做过复核。
+        self.generate.return_value = decision()
         await self.engine.round(preview=True)
         self.client.publish.assert_awaited_once()
         self.engine.share_video.assert_not_awaited()
         self.assertTrue(self.store.acknowledge("1001", ITEM.bvid))
         self.now += 7200
         await self.engine.start()
-        await self.engine.round()
-        self.client.publish.assert_awaited_once()
+        self.generate.side_effect = [json.dumps({"selected_bvid": fresh.bvid, "reason": "想聊这条"}),
+                                    decision(comment="深海里这些不同颜色的闪光，居然还能给彼此传递信号。")]
+        self.client.publish.side_effect = None
+        self.assertIn("已提交评论", await self.engine.round())
+        self.assertEqual(self.client.publish.await_count, 2)
+        self.assertEqual(self.client.publish.call_args.args[0].bvid, fresh.bvid)
+        self.assertTrue(self.store.seen("1001", ITEM.bvid, "publish"))
+
+    async def test_unresolved_posts_preserve_manual_pause_and_preview(self):
+        await self.engine.start()
+        self.store.reserve("1001", "BV0987654321", "旧评论", self.now, 0, 12, 0, .88)
+        self.store.finish("1001", "BV0987654321", "unknown")
+        await self.engine.pause("管理员手动暂停", kind="manual")
+        await self.engine.initialize()
+        await self.engine.start(automatic=True)
+        self.assertTrue(self.engine.paused)
+        self.assertEqual(self.engine.pause_kind, "manual")
+        self.assertIn("预览评论", await self.engine.round(preview=True))
+        self.assertTrue(self.engine.paused)
+        self.client.publish.assert_not_awaited()
+
+    async def test_pending_attempt_after_restart_keeps_autonomous_browsing_and_blocks_all_sends(self):
+        await self.engine.start()
+        self.store.reserve("1001", "BV0987654321", "进程中断的评论", self.now, 0, 12, 0, .88)
+        await self.engine.initialize()  # pending 转 unknown，不暂停浏览。
+        self.now += 7200
+        self.cfg.replies.enabled = True
+        self.cfg.browse.autonomous_enabled = True
+        self.cfg.browse.interval_seconds = 600
+        self.cfg.browse.max_check_minutes = 20
+        self.generate.side_effect = [
+            json.dumps({"should_browse": True, "reason": "想看新视频", "next_check_minutes": 10}),
+            decision(comment=""),
+        ]
+        self.assertIn("待核对", await self.engine.reply_round())
+        self.assertIn("候选保留中", await self.engine.round())
+        self.assertFalse(self.engine.paused)
+        self.client.understand.assert_awaited_once()
+        self.client.publish.assert_not_awaited()
+        self.client.publish_reply.assert_not_awaited()
+        self.assertGreater(await self.engine.next_check_delay(), 1)
 
     async def test_daily_view_limit_also_bounds_manual_previews(self):
         self.cfg.browse.videos_per_day = 1

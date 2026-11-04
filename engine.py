@@ -115,9 +115,6 @@ class Autopilot:
             if automatic and self.paused and self.pause_kind not in {"initial", "login", "disabled"}:
                 return "当前为手动或异常暂停，请使用 start 恢复"
             stats = await asyncio.to_thread(self.store.stats, uid, local_day_start(self.clock(), cfg.browse.timezone))
-            if stats["unresolved"]:
-                await self.pause("存在待核对的评论发送结果")
-                return "存在待核对评论：" + ", ".join(stats["unresolved"]) + "；核对后使用 ack BV号"
             async with self._control_lock:
                 if revision != self._control_revision or not self.get_config().plugin.enabled:
                     return "启动期间状态已变化，本次启动已取消"
@@ -126,6 +123,8 @@ class Autopilot:
                     return "启动期间已收到暂停，本次启动已取消"
                 self.paused, self.pause_reason = False, ""
                 self.pause_kind = "running"
+        if stats["unresolved"]:
+            return "已恢复浏览；" + self.publication_hold(stats)
         if cfg.browse.autonomous_enabled:
             return "已进入自主模式，由麦麦决定这次刷不刷 B 站；" + (
                 "有合适内容时允许发表评论" if cfg.comment.publish_enabled else "评论仅预览，不会发布"
@@ -232,7 +231,9 @@ class Autopilot:
                 self.last_reply_result = str(exc)
             except (asyncio.TimeoutError, ModelTimeoutError):
                 self.last_reply_result = "模型判断超时，本次跟进跳过；自动运行保持开启，下次检查继续"
-            except (LoginRequired, ModelResponseError, PlatformError, PublishNotSent, UnknownPublish) as exc:
+            except UnknownPublish as exc:
+                self.last_reply_result = f"{exc}；评论及跟进回复暂缓，自主浏览继续"
+            except (LoginRequired, ModelResponseError, PlatformError, PublishNotSent) as exc:
                 await self.pause(str(exc))
                 self.last_reply_result = f"已暂停：{exc}"
             except Exception as exc:
@@ -253,9 +254,10 @@ class Autopilot:
         if not preview and self.clock() < last + cfg.replies.interval_seconds:
             return self.last_reply_result
         stats = await asyncio.to_thread(self.store.stats, uid, local_day_start(self.clock(), cfg.browse.timezone))
-        if stats["unresolved"]:
-            await self.pause("存在待核对的评论或跟进回复发送结果")
-            return "待核对：" + "、".join(stats["unresolved"])
+        if stats["unresolved"] and not preview:
+            # 待核对只拦发送；推进检查时间，避免调度器每秒空转。
+            await asyncio.to_thread(self.store.set_reply_check, uid, self.clock())
+            return self.publication_hold(stats)
         own = await asyncio.to_thread(self.store.own_comments, uid)
         if not own:
             await asyncio.to_thread(self.store.set_reply_check, uid, self.clock())
@@ -592,6 +594,14 @@ class Autopilot:
         detail = json.dumps(fields, ensure_ascii=False)
         await asyncio.to_thread(self.store.visit, uid, item.bvid, mode, self.clock(), outcome, detail, retryable)
 
+    def publication_hold(self, stats: Dict[str, Any]) -> str:
+        if not stats["unresolved"]:
+            return ""
+        return (
+            "发送结果待核对：" + "、".join(stats["unresolved"])
+            + "；评论及跟进回复暂缓，自主浏览继续；核对后使用 ack BV号"
+        )
+
     def comment_cooldown(self, stats: Dict[str, Any], cfg: AutopilotConfig) -> str:
         until = stats["last_attempt"] + cfg.comment.min_interval_seconds
         if not stats["last_attempt"] or self.clock() >= until:
@@ -618,7 +628,9 @@ class Autopilot:
                 self.last_result = str(exc)
             except (asyncio.TimeoutError, ModelTimeoutError):
                 self.last_result = "模型判断超时，本轮跳过；自动运行保持开启，下轮继续"
-            except (LoginRequired, ModelResponseError, PlatformError, PublishNotSent, UnknownPublish) as exc:
+            except UnknownPublish as exc:
+                self.last_result = f"{exc}；评论及跟进回复暂缓，自主浏览继续"
+            except (LoginRequired, ModelResponseError, PlatformError, PublishNotSent) as exc:
                 await self.pause(str(exc))
                 self.last_result = f"已暂停：{exc}"
             except Exception as exc:
@@ -709,9 +721,6 @@ class Autopilot:
         uid = await self._read("account", self.client.check_account, cfg)
         day_start = local_day_start(self.clock(), cfg.browse.timezone)
         stats = await asyncio.to_thread(self.store.stats, uid, day_start)
-        if stats["unresolved"]:
-            await self.pause("存在待核对的评论发送结果")
-            return "待核对评论：" + ", ".join(stats["unresolved"])
         mode = "publish" if cfg.comment.publish_enabled and not preview else "preview"
         cooling = mode == "publish" and bool(self.comment_cooldown(stats, cfg))
         quota_full = mode == "publish" and stats["attempts"] >= cfg.comment.per_day
@@ -733,7 +742,8 @@ class Autopilot:
         pool = (await asyncio.to_thread(self.store.candidates, uid, eligible, self.clock(),
                                         cfg.browse.backlog_max_items) if mode == "publish" else [])
         control = await asyncio.to_thread(self.store.control)
-        comment_only = bool(pool and not until and float(control.get("candidate_check:" + uid, "0")) <= self.clock())
+        comment_only = bool(pool and not stats["unresolved"] and not until
+                            and float(control.get("candidate_check:" + uid, "0")) <= self.clock())
         items = None
         if comment_only:
             shortlist = pool[:10]
@@ -886,7 +896,8 @@ class Autopilot:
             latest = await asyncio.to_thread(self.store.stats, uid,
                                             local_day_start(self.clock(), cfg.browse.timezone))
             candidate_only = mode == "publish" and (
-                bool(self.comment_cooldown(latest, cfg)) or latest["attempts"] >= cfg.comment.per_day
+                bool(latest["unresolved"]) or bool(self.comment_cooldown(latest, cfg))
+                or latest["attempts"] >= cfg.comment.per_day
             )
             prompt = decision_prompt(
                 item,
@@ -1036,11 +1047,13 @@ class Autopilot:
                                                 local_day_start(self.clock(), cfg.browse.timezone))
                 quota_full = latest["attempts"] >= cfg.comment.per_day
                 until = max(next_local_day(self.clock(), cfg.browse.timezone) if quota_full else 0,
-                            latest["last_attempt"] + cfg.comment.min_interval_seconds)
+                            latest["last_attempt"] + cfg.comment.min_interval_seconds,
+                            self.clock() + cfg.browse.interval_seconds if latest["unresolved"] else 0)
                 fields = json.loads(detail)
                 fields.update(video=asdict(item),
                               decision_reason=decision.reason, comment="", candidate_only=True,
-                              reason="daily_limit" if quota_full else self.comment_cooldown(latest, cfg))
+                              reason=self.publication_hold(latest) or (
+                                  "daily_limit" if quota_full else self.comment_cooldown(latest, cfg)))
                 await asyncio.to_thread(self.store.wait_video, uid, item, self.clock(),
                                         json.dumps(fields, ensure_ascii=False), until,
                                         cfg.browse.backlog_max_age_hours, cfg.browse.backlog_max_items,
@@ -1184,7 +1197,7 @@ class Autopilot:
             f"；发送尝试：{stats['attempts']}/{cfg.comment.per_day}"
             f"\n跟进回复：{'开启' if cfg.replies.enabled else '关闭'}；今日发送尝试：{stats['reply_attempts']}/{cfg.replies.per_day}"
             f"；今日分析：{stats['reply_analyses']}/{cfg.replies.analyses_per_day}"
-            f"\n评论发送间隔：{self.comment_cooldown(stats, cfg) or '已满足发送间隔'}"
+            f"\n评论发送状态：{self.publication_hold(stats) or self.comment_cooldown(stats, cfg) or '已满足发送间隔'}"
             f"\n评论候选：{await self.candidate_pool_status()}"
             f"\n待核对：{', '.join(stats['unresolved']) or '无'}\n暂停原因：{self.pause_reason or '无'}"
             f"{autonomy}\n{recovery}\n今日模型调用：{usage['calls']}；累计 {usage['elapsed_seconds']} 秒"

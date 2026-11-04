@@ -178,6 +178,20 @@ class WebUITests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.plugin.autopilot_command("/bili_auto pause"))["ok"])
         self.assertEqual(self.plugin.engine.store.control()["pause_kind"], "manual")
 
+    async def test_unresolved_post_displays_send_hold_without_pausing_browsing(self):
+        await self.plugin.engine.start()
+        store = self.plugin.engine.store
+        store.reserve("1", ITEM.bvid, "未知发送的评论", 100, 0, 3, 0, .88)
+        store.finish("1", ITEM.bvid, "unknown")
+        overview = await self.plugin.autopilot_overview()
+        self.assertEqual(overview["state"], "自主运行中")
+        self.assertIn("暂缓", overview["mode"])
+        self.assertIn("浏览继续", overview["comment_cooldown"])
+        self.assertEqual(overview["unresolved"], ITEM.bvid)
+        self.assertEqual(overview["pause_reason"], "无")
+        self.assertIn("待核对", await self.plugin.engine.status())
+        self.client.publish.assert_not_awaited()
+
     async def test_ack_is_account_scoped_and_does_not_resume_or_resend(self):
         store = self.plugin.engine.store
         store.set_pause(False, "")

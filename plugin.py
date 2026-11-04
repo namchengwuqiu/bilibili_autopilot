@@ -504,9 +504,11 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             else "自主运行中"
             if cfg.browse.autonomous_enabled
             else "定时运行中",
-            "mode": "允许自动评论" if cfg.comment.publish_enabled else "仅预览评论",
+            "mode": ("评论及跟进回复暂缓（发送结果待核对，浏览继续）"
+                     if stats["unresolved"] else "允许自动评论") if cfg.comment.publish_enabled else "仅预览评论",
             "candidate_pool": await self.engine.candidate_pool_status(),
-            "comment_cooldown": (self.engine.comment_cooldown(stats, cfg) or "已满足发送间隔")
+            "comment_cooldown": (self.engine.publication_hold(stats)
+                                 or self.engine.comment_cooldown(stats, cfg) or "已满足发送间隔")
             if cfg.comment.publish_enabled
             else "仅预览，不受发送冷却限制",
             "views": f"{stats['views']} / {cfg.browse.videos_per_day}",

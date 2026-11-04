@@ -211,10 +211,16 @@ class ReplyEngineTests(unittest.IsolatedAsyncioTestCase):
         self.client.publish_reply.side_effect=UnknownPublish('timeout with secret')
         result=await self.engine.reply_round()
         self.assertIn('待核对',result);self.assertNotIn('secret',result)
-        self.assertTrue(self.engine.paused)
+        self.assertFalse(self.engine.paused)
         self.assertEqual(self.store.stats('1',0)['unresolved'],[MESSAGE.bvid])
         await self.engine.initialize()
         self.assertIn('待核对',await self.engine.start())
+        self.now += 7200
+        self.assertIn('待核对', await self.engine.reply_round())
+        self.assertFalse(self.engine.paused)
+        self.assertEqual(self.store.last_reply_check('1'), self.now)
+        self.assertGreater(await self.engine.next_check_delay(), 1)
+        self.client.publish_reply.assert_awaited_once()
         self.assertTrue(self.store.acknowledge('1',MESSAGE.bvid))
         await self.engine.start();self.now+=7200
         await self.engine.reply_round()
