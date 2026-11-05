@@ -7,21 +7,21 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`；当前版本：`0.8.7`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本：`0.6.0`；当前准备版本：`0.8.8`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
 1. 在公开仓库默认分支的根目录提交源码和资源，确保 `_manifest.json`、`plugin.py`、`README.md`、`LICENSE` 都位于根目录。
-2. 运行 `python scripts/validate_release.py --tag v0.8.7`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
+2. 运行 `python scripts/validate_release.py --tag v0.8.8`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
 3. 确认源码仓库不包含 `config.toml`、`config_back/`、登录凭据、二维码、数据库及运行数据。默认示例仅使用 `config.example.toml`。
-4. 创建并推送 `v0.8.7` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
+4. 创建并推送 `v0.8.8` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
 5. 确认 Release 已公开发布，随后按 [市场登记文案](MARKETPLACE_SUBMISSION.md) 在插件中心创建新增插件 Issue。
 6. 等待市场验证、同步及审核收录。只有仓库代码或 Tag 不满足首次登记要求，草稿 Release 也不满足要求。
 
 手动生成用于检查的发布附件：
 
 ```sh
-python scripts/validate_release.py --tag v0.8.7 \
+python scripts/validate_release.py --tag v0.8.8 \
   --archive dist/bilibili-autopilot.zip --notes dist/release-notes.md
 ```
 
@@ -121,3 +121,11 @@ ZIP 根目录直接包含插件文件，不套多层目录。脚本使用固定�
 本版不修改配置格式、依赖或数据库结构。保留 `config.toml`、凭据与最新状态库更新公共文件并重载。旧版已经异常暂停的实例，使用管理页恢复运行按钮或 `/bili_auto start` 即可恢复浏览；若仍有未知记录，发送继续受保护，核对 B 站实际结果后再用页面核对按钮或 `/bili_auto ack BV号` 解除。人工暂停不会自动恢复，`ack` 不会重发原评论，也不表示发送成功。
 
 Docker 中运行 293 项隔离测试，291 项通过、2 项按环境条件跳过；覆盖评论与跟进结果未知、重载、浏览与候选保留、预览、人工暂停、发送事务拦截和管理页状态。使用 `python scripts/validate_release.py --tag v0.8.7` 校验版本与公共文件清单，发布包不得包含本地配置、凭据、数据库、日志或部署修复记录。
+
+## 0.8.8 升级与验证
+
+针对 #1 中 `验证扫码账号 client=curl_cffi code=77` 的故障，账号验证、后续读取及评论签名准备使用本插件专用的 httpx 客户端。证书和主机名验证保持开启。通过任务上下文限定本插件的传输层，保留同进程其他插件的默认 B 站客户端；模块重载不会叠加入口包装。
+
+保留现有 `config.toml`、凭据和最新状态库更新公共文件，完整安装包必须包含新增的 `transport.py`。重新加载后检查 `plugin=0.8.8`，再次扫码验证 `stage=验证扫码账号 client=httpx`。已登录实例无需清空历史或重新登录。若 httpx 仍失败，继续根据脱敏诊断排查证书或网络环境。
+
+隔离测试覆盖真实库账号验证、UID 校验、中文临时目录、后续读取、ticket 辅助请求、签名准备、未知 POST 不重试、任务隔离、取消及模块重载，并检查 TLS 校验开启。CI 增加 Windows / Python 3.12；安装包和自动化测试均不使用真实账号。

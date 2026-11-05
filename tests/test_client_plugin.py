@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs
 
 import asyncio
+import os
 import json
 import time
 import unittest
@@ -155,7 +156,8 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.client.http = httpx.AsyncClient(transport=httpx.MockTransport(qr_response))
         with patch("local_bilibili_autopilot.client.user.get_self_info", AsyncMock(return_value={"mid": 1, "name": "测试"})):
             self.assertIn("已登录", await self.client.poll_login("test-key"))
-        self.assertEqual(self.client.credential_path.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":  # Windows 的 chmod 只控制只读标记，不表达 POSIX 权限位。
+            self.assertEqual(self.client.credential_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(self.client.credential_path.read_text())["uid"], "1")
         self.assertEqual(len(self.client.http.cookies), 0)
         await self.client.logout()

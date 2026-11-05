@@ -15,7 +15,8 @@ import re
 import tempfile
 import time
 
-from bilibili_api import Credential, comment, get_selected_client, homepage, session, user, video
+from bilibili_api import Credential, comment, homepage, session, user, video
+from bilibili_api.clients.HTTPXClient import HTTPXClient
 from bilibili_api.exceptions import NetworkException, ResponseCodeException
 from bilibili_api.utils.network import Api
 
@@ -23,6 +24,7 @@ import httpx
 import qrcode
 
 from .models import Evidence, IncomingReply, VideoItem, normalized, recommendations
+from .transport import api_transport
 
 
 READ_NETWORK_ERRORS = (asyncio.TimeoutError, httpx.TimeoutException, httpx.NetworkError)
@@ -66,6 +68,8 @@ def login_error_details(error: Exception) -> str:
             value = getattr(current, name, None)
             if isinstance(value, int) and not isinstance(value, bool) and -(2 ** 31) <= value < 2 ** 31:
                 fields.append(f"{name}={int(value)}")
+                if name == "code" and value == 77 and type(current).__module__.startswith("curl_cffi."):
+                    categories.add("ca_bundle_unreadable")
         message = str(current).lower()
         categories.update(name for name, phrases in hints.items() if any(phrase in message for phrase in phrases))
         chain.append(",".join(fields))
@@ -92,11 +96,6 @@ def login_environment() -> str:
             value = "not-installed"
         fields.append(f"{name}={value}")
     return "; ".join(fields)
-
-
-def login_api_client() -> str:
-    name = get_selected_client()[0]
-    return name if name in {"curl_cffi", "aiohttp", "httpx"} else "custom"
 
 
 class PlatformError(Exception):
@@ -208,6 +207,8 @@ class BiliClient:
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"},
         )
         self.public_http = httpx.AsyncClient(timeout=20, follow_redirects=False)
+        # 显式启用 TLS 校验；与二维码相同的 httpx 路径，不依赖 curl 的 CA 文件读取。
+        self.api_http = HTTPXClient(timeout=20, verify_ssl=True)
 
     async def load(self) -> None:
         def read() -> Optional[Dict[str, Any]]:
@@ -235,12 +236,14 @@ class BiliClient:
     async def close(self) -> None:
         await self.http.aclose()
         await self.public_http.aclose()
+        await self.api_http.close()
 
     async def logout(self) -> None:
         await asyncio.to_thread(self.credential_path.unlink, missing_ok=True)
         self.credential = None
         self.uid = self.name = ""
         self.http.cookies.clear()
+        self.api_http.get_wrapped_session().cookies.clear()
 
     async def check_account(self) -> str:
         if self.credential is None:
@@ -309,10 +312,11 @@ class BiliClient:
                 if not all(cookies.get(k) for k in ("SESSDATA", "bili_jct", "DedeUserID")):
                     raise LoginRequired("扫码成功但缺少发布评论所需凭据，请重新登录")
                 credential = Credential.from_cookies(cookies)
-                client = login_api_client()
+                client = "httpx"
                 self._login_progress("验证扫码账号", client)
                 try:
-                    info = await asyncio.wait_for(user.get_self_info(credential), timeout=30)
+                    with api_transport(self.api_http):
+                        info = await asyncio.wait_for(user.get_self_info(credential), timeout=30)
                 except ResponseCodeException as exc:
                     raise PlatformError("验证扫码账号", exc.code) from None
                 except Exception as exc:
@@ -416,7 +420,8 @@ class BiliClient:
 
     async def _read_stage(self, stage: str, operation: Awaitable[Any]) -> Any:
         try:
-            return await asyncio.wait_for(operation, timeout=30)
+            with api_transport(self.api_http):
+                return await asyncio.wait_for(operation, timeout=30)
         except ResponseCodeException as exc:
             raise PlatformError(stage, exc.code) from None
         except READ_NETWORK_ERRORS as exc:
@@ -583,7 +588,8 @@ class BiliClient:
             data.update(root=root, parent=parent)
         request.update_data(**data)
         try:
-            prepared = await asyncio.wait_for(request._prepare_request(), timeout=30)
+            with api_transport(self.api_http):
+                prepared = await asyncio.wait_for(request._prepare_request(), timeout=30)
         except ResponseCodeException as exc:
             raise PlatformError("准备评论签名", exc.code) from None
         except Exception as exc:

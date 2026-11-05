@@ -51,6 +51,12 @@ class DiagnosticDetailsTests(unittest.TestCase):
         self.assertIn("ca_bundle_unreadable", details)
         self.assertNotIn("private", details)
 
+    @unittest.skipUnless(CurlSSLError, "curl_cffi 未安装")
+    def test_code_77_alone_identifies_unreadable_ca_bundle(self):
+        details = login_error_details(CurlSSLError(PRIVATE, code=77))
+        self.assertIn("ca_bundle_unreadable", details)
+        self.assertNotIn("private", details)
+
     def test_arbitrary_string_attributes_are_not_logged_and_cycles_stop(self):
         error = RuntimeError(PRIVATE)
         error.code = PRIVATE
@@ -89,8 +95,7 @@ class LoginDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
         self.client.http = httpx.AsyncClient(transport=httpx.MockTransport(transport))
         self.info = AsyncMock(return_value={"mid": 1, "name": "模拟账号"})
-        for target, replacement in (("user.get_self_info", self.info),
-                                    ("get_selected_client", Mock(return_value=("curl_cffi", object)))):
+        for target, replacement in (("user.get_self_info", self.info),):
             patcher = patch("local_bilibili_autopilot.client." + target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -122,12 +127,12 @@ class LoginDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.client.credential_path.exists())
         self.assert_private_absent(str(raised.exception) + self.logs())
 
-    async def test_account_ssl_failure_identifies_selected_client_and_does_not_persist(self):
+    async def test_account_ssl_failure_identifies_httpx_and_does_not_persist(self):
         self.info.side_effect = ssl.SSLError(1, "WRONG_VERSION_NUMBER " + PRIVATE)
         with self.assertRaises(LoginDiagnosticError) as raised:
             await self.client.poll_login("private-qr")
         self.assertIn("阶段=验证扫码账号", str(raised.exception))
-        self.assertIn("客户端=curl_cffi", str(raised.exception))
+        self.assertIn("客户端=httpx", str(raised.exception))
         self.assertIn("wrong_tls_version", str(raised.exception))
         self.assertFalse(self.client.credential_path.exists())
         self.assertIsNone(self.client.credential)
