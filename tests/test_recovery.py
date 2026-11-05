@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, patch
 
 import asyncio
 import json
-import sqlite3
 import unittest
 
 from bilibili_api.exceptions import NetworkException, ResponseCodeException
@@ -418,7 +417,7 @@ class StoreRecoveryTests(unittest.TestCase):
 
     def test_legacy_schema_upgrade_preserves_data_and_only_seeds_counts_once(self):
         self.path.unlink()
-        with sqlite3.connect(self.path) as db:
+        with self.store.connect() as db:
             db.executescript('''CREATE TABLE visits(uid TEXT,bvid TEXT,mode TEXT,ts REAL,outcome TEXT,detail TEXT,PRIMARY KEY(uid,bvid,mode));
                 CREATE TABLE attempts(uid TEXT,bvid TEXT,ts REAL,text TEXT,text_hash TEXT,status TEXT,rpid TEXT,PRIMARY KEY(uid,bvid));''')
             db.execute('INSERT INTO visits VALUES (?,?,?,?,?,?)',('1',ITEM.bvid,'publish',100,'sent','{}'))

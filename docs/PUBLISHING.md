@@ -7,7 +7,7 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`；当前准备版本：`0.8.8`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本：`0.6.0`；当前版本：`0.8.8`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
