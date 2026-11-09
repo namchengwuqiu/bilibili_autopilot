@@ -1,5 +1,9 @@
 # B站自主浏览与评论 更新日志
 
+## 未发布
+
+- 将 MaiBot 兼容上限更新至 1.4.3，保留最低版本 1.3.10。
+
 ## 0.8.8 2026-11-05
 
 - 针对 [#1](https://github.com/namchengwuqiu/bilibili_autopilot/issues/1) 反馈的扫码后 `curl_cffi SSLError code=77`（本地 CA 证书文件读取失败），将账号验证、后续读取及签名准备绑定到本插件专用的 `httpx` 客户端，保持证书与主机名校验开启。
