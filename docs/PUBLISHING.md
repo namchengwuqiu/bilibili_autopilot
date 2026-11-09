@@ -7,21 +7,21 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`；当前版本：`0.8.8`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本：`0.6.0`；当前版本：`0.8.9`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
 1. 在公开仓库默认分支的根目录提交源码和资源，确保 `_manifest.json`、`plugin.py`、`README.md`、`LICENSE` 都位于根目录。
-2. 运行 `python scripts/validate_release.py --tag v0.8.8`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
+2. 运行 `python scripts/validate_release.py --tag v0.8.9`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
 3. 确认源码仓库不包含 `config.toml`、`config_back/`、登录凭据、二维码、数据库及运行数据。默认示例仅使用 `config.example.toml`。
-4. 创建并推送 `v0.8.8` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
+4. 创建并推送 `v0.8.9` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
 5. 确认 Release 已公开发布，随后按 [市场登记文案](MARKETPLACE_SUBMISSION.md) 在插件中心创建新增插件 Issue。
 6. 等待市场验证、同步及审核收录。只有仓库代码或 Tag 不满足首次登记要求，草稿 Release 也不满足要求。
 
 手动生成用于检查的发布附件：
 
 ```sh
-python scripts/validate_release.py --tag v0.8.8 \
+python scripts/validate_release.py --tag v0.8.9 \
   --archive dist/bilibili-autopilot.zip --notes dist/release-notes.md
 ```
 

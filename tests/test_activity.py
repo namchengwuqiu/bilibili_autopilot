@@ -121,7 +121,10 @@ class ActivityToolTests(unittest.IsolatedAsyncioTestCase):
         components = self.plugin.get_components()
         tool = next(c for c in components if c["name"] == "bilibili_autopilot_history")
         self.assertEqual(tool["type"], "TOOL")
-        self.assertIn("先用本工具查真实记录", tool["metadata"]["detailed_description"])
+        metadata = tool["metadata"]
+        # SDK 2.22 将旧版的两段工具说明合并到了 description。
+        description = metadata["detailed_description"] if "detailed_description" in metadata else metadata["description"]
+        self.assertIn("先用本工具查真实记录", description)
         result = await self.plugin.tool_history(query="海洋", stream_id="qq-stream", uid="other-account")
         self.assertTrue(result["success"])
         payload = json.loads(result["content"])

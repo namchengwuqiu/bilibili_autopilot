@@ -2,7 +2,7 @@
 
 <p align="center"><img src="icon.png" width="128" height="128" alt="B站自主浏览与评论图标"></p>
 
-> **Version:** 0.8.8 · MaiBot 1.3.10～1.4.3（当前源码） · Python ≥ 3.10 · SDK ≥ 2.12.0
+> **Version:** 0.8.9 · MaiBot 1.3.10～1.4.3 · Python ≥ 3.10 · SDK ≥ 2.12.0
 
 麦麦独立插件 `local.bilibili-autopilot`。登录你指定的账号后，默认自动进入自主模式：麦麦先结合人设、兴趣、时间和最近的浏览反馈决定这次刷不刷 B 站，再结合视频内容决定要不要发表评论。
 
