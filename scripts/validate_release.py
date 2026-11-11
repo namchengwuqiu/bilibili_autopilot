@@ -12,7 +12,7 @@ import zipfile
 
 PLUGIN_ID = "local.bilibili-autopilot"
 FILES = (
-    "__init__.py", "_manifest.json", "plugin.py", "client.py", "transport.py", "config.py", "engine.py",
+    "__init__.py", "_manifest.json", "plugin.py", "client.py", "transport.py", "config.py", "engine.py", "miniapp.py",
     "models.py", "sharing.py", "state.py", "activity.py", "webui.py", "webui.json", "icon.png",
     "README.md", "CHANGELOG.md", "LICENSE", "requirements.txt", "pyproject.toml",
     "config.example.toml", "docs/PUBLISHING.md", "docs/MARKETPLACE_SUBMISSION.md", "docs/ICON.md",

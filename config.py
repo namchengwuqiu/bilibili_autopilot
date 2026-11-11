@@ -324,10 +324,10 @@ class ModelSection(PluginConfigBase):
         },
     )
     evidence_retention_days: int = Field(
-        default=7, ge=1, le=30, description="本地引用片段与时间位置保留天数",
+        default=7, ge=1, le=30, description="已读取的字幕或摘要摘录、引用与时间位置保留天数",
         json_schema_extra={
             "label": "内容依据缓存保留天数",
-            "hint": "默认保留本地引用片段和时间位置 7 天，可填 1～30，供后续分享等处理查阅。这里只控制内容依据缓存，不是浏览和评论历史记录的保留期限。",
+            "hint": "默认保留已读取的字幕或摘要摘录、引用和时间位置 7 天，可填 1～30，供后续分享查阅；不额外读取视频。这里只控制内容依据缓存，不是浏览和评论历史记录的保留期限。",
         },
     )
     task: str = Field(
@@ -468,11 +468,11 @@ class ShareSection(PluginConfigBase):
     __ui_label__ = "评论后分享视频"
     __ui_order__ = 5
     miniapp_enabled: bool = Field(
-        default=False,
-        description="先发送 B 站 QQ 小程序卡片，确认成功后再发送分享感想",
+        default=True,
+        description="感想通过复核后发送 B 站 QQ 小程序卡片，卡片确认后再单独发送感想",
         json_schema_extra={
             "label": "使用 QQ 小程序卡片分享",
-            "hidden": True,
+            "hint": "默认开启。卡片内可查看对应视频，不提供打开 B 站 App 按钮；卡片确认后只发送感想，不重复附链接。关闭后发送感想和官方视频链接。",
         },
     )
     polish_enabled: bool = Field(
@@ -501,7 +501,7 @@ class ShareSection(PluginConfigBase):
         default=120, ge=10, le=360, description="分享草稿、润色及复核的总时限",
         json_schema_extra={
             "label": "分享文案处理总时限（秒）",
-            "hint": "分享草稿生成、修改、润色和依据复核共用的时间预算，默认 120 秒＝2 分钟，可填 10～360。达到总时限后放弃本次分享，不影响已经成功发布的 B 站评论。",
+            "hint": "分享草稿生成、修改、润色和依据复核共用的时间预算，默认 120 秒＝2 分钟，可填 10～360。润色超时使用已通过复核的初稿；没有通过复核的感想则跳过分享。",
         },
     )
     qq_group_ids: List[str] = Field(
@@ -510,7 +510,7 @@ class ShareSection(PluginConfigBase):
         description="评论成功后分享视频的 QQ 群号；默认留空，不分享",
         json_schema_extra={
             "label": "分享视频的 QQ 群号",
-            "hint": "默认留空，不分享。每项填写一个麦麦已加入的 QQ 群号，最多 10 个。仅实际提交成功的视频一级评论触发，预览、跳过和跟进回复不触发。发送分享感想和视频链接。同一视频对同一群只尝试分享一次，失败或结果未知不会自动重发。",
+            "hint": "默认留空，不分享。每项填写一个麦麦已加入的 QQ 群号，最多 10 个。仅实际提交成功的视频一级评论触发，预览、跳过和跟进回复不触发。按配置发送小程序卡片和感想，或感想加官方链接。同一视频对同一群只尝试分享一次，失败或结果未知不会自动重发。",
             "placeholder": "例如：123456789",
         },
     )

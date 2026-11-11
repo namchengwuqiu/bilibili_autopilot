@@ -89,6 +89,25 @@ class HandoffEngineTests(unittest.IsolatedAsyncioTestCase):
         self.store.reserve("1", "BV0987654321", "今天早些时候的其他评论", self.now - 7200, 0, 10, 300, 0.88)
         self.store.finish("1", "BV0987654321", "sent", "400")
 
+    async def test_share_can_reuse_read_text_beyond_the_comment_quote(self):
+        self.cfg.model.content_max_chars = 500
+        read_text = EVIDENCE.text + "实际读取的上下文。" * 100
+        evidence = replace(EVIDENCE, text=read_text)
+        self.client.understand.return_value = (ITEM, evidence)
+        captured = {}
+
+        async def share(uid, item):
+            captured.update(self.store.content_context(uid, item.bvid, self.now))
+            return "群分享检查完成"
+
+        self.engine.share_video = share
+        await self.engine.round()
+        self.assertEqual(captured["text"], read_text[:500])
+        self.assertNotEqual(captured["text"], captured["quote"])
+        self.assertEqual(captured["coverage"], evidence.coverage)
+        self.assertEqual(self.store.content_context("another-account", ITEM.bvid, self.now), {})
+        self.client.understand.assert_awaited_once()
+
     async def test_quota_wait_same_day_restart_and_next_day_fresh_generation(self):
         self.quota()
         self.assertIn("daily_limit", await self.engine.round())
@@ -476,6 +495,32 @@ class SharePolishTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin._share_steps(ITEM, self.context, self.plugin.config.model_copy(deep=True)), self.draft
         )
 
+    async def test_total_deadline_during_polish_preserves_reviewed_draft(self):
+        config = self.plugin.config
+        self.plugin._plugin_config_instance = config.model_copy(update={
+            "share": config.share.model_copy(update={"total_timeout_seconds": 0.25}),
+        })
+        steps = iter([json.dumps({"text": self.draft}), support(), None])
+        polish_cancelled = asyncio.Event()
+
+        async def generate(*args):
+            response = next(steps)
+            if response is not None:
+                return response
+            try:
+                await asyncio.Event().wait()
+            finally:
+                polish_cancelled.set()
+
+        self.plugin._generate = AsyncMock(side_effect=generate)
+        trace = {}
+        cfg = self.plugin.config.model_copy(deep=True)
+        result = await asyncio.wait_for(self.plugin._share_steps(ITEM, self.context, cfg, trace=trace), timeout=2)
+        self.assertEqual(result, self.draft)
+        self.assertTrue(polish_cancelled.is_set())
+        self.assertTrue(trace["draft_review"]["supported"])
+        self.assertEqual(trace["result_mode"], "fallback")
+
     async def test_draft_review_failure_never_returns_sendable_text(self):
         self.plugin._generate = AsyncMock(side_effect=[json.dumps({"text": "我以前去过这里"}), support(False)])
         with self.assertRaises(DecisionValidationError):
@@ -492,6 +537,7 @@ class SharePolishTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejected_draft_is_rewritten_once_with_specific_feedback_and_reviewed(self):
         self.plugin.config.share.polish_enabled = False
         rejection = {"supported": False, "kind": "factual", "reason": "摘录未提供祠堂地点"}
+        self.context["reason"] = "旧判断中缺乏依据的祠堂地点"
         self.plugin._generate = AsyncMock(side_effect=[
             json.dumps({"text": "跑去祠堂问公司能不能活三年"}), json.dumps(rejection),
             json.dumps({"text": "这问题压力有点大"}), support(),
@@ -503,6 +549,11 @@ class SharePolishTests(unittest.IsolatedAsyncioTestCase):
         retry_context = json.loads(self.plugin._generate.await_args_list[2].args[0][1]["content"])
         self.assertEqual(retry_context["validation_feedback"]["reason"], rejection["reason"])
         self.assertEqual(retry_context["content_evidence"], self.context["content_evidence"])
+        self.assertEqual(retry_context["rejected_text"], "跑去祠堂问公司能不能活三年")
+        self.assertNotIn("my_comment", retry_context)
+        self.assertNotIn("reason", retry_context)
+        first_context = json.loads(self.plugin._generate.await_args_list[0].args[0][1]["content"])
+        self.assertNotIn("reason", first_context)
         review_context = json.loads(self.plugin._generate.await_args_list[3].args[0][1]["content"])
         self.assertEqual(review_context["body"], result)
         self.assertEqual(len(trace["draft_attempts"]), 2)

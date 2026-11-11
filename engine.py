@@ -1027,7 +1027,8 @@ class Autopilot:
                     self.store.cache_evidence,
                     uid,
                     item.bvid,
-                    {"quote": quote, "segments": segments, "source": evidence.source, "coverage": evidence.coverage},
+                    {"quote": quote, "text": evidence.text[:cfg.model.content_max_chars], "segments": segments,
+                     "source": evidence.source, "coverage": evidence.coverage},
                     self.clock(),
                     cfg.model.evidence_retention_days,
                 )

@@ -31,6 +31,17 @@ def local_time(timestamp: float, timezone: str) -> str:
     return datetime.fromtimestamp(timestamp, ZoneInfo(timezone)).strftime("%m-%d %H:%M:%S")
 
 
+def share_outcome(row: Dict[str, Any]) -> str:
+    status, detail = row["status"], row["detail"]
+    if status == "failed" and detail.startswith("分享文案生成"):
+        if "校验失败" in detail:
+            return "感想校验未通过（未发送）"
+        if "TimeoutError" in detail:
+            return "感想生成超时（未发送）"
+        return "感想生成失败（未发送）"
+    return SHARE_OUTCOMES.get(status, status)
+
+
 def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
     result = {"time": local_time(row.get("ts",row.get("received_at")), timezone), "title": "", "bvid": "", "url": "",
               "outcome": "", "mode": "", "interest": "", "comment": "", "reason": "",
@@ -45,10 +56,10 @@ def record_row(row: Dict[str, Any], kind: str, timezone: str) -> Dict[str, Any]:
     result['retry_status'] = retry_status(row,timezone)
     if kind == "shares":
         result.update(title=row['title'],bvid=row['bvid'],url='https://www.bilibili.com/video/'+row['bvid'],
-                      outcome=SHARE_OUTCOMES.get(row['status'],row['status']),mode='评论后群分享',
+                      outcome=share_outcome(row),mode='评论后群分享',
                       reason=f"QQ 群 {row['group_id']}；{row['detail']}",rpid=row['message_id'])
         if row.get('card_sent'):
-            result['reason'] = f"QQ 群 {row['group_id']}；小程序卡片已发送（消息 ID：{row.get('card_message_id') or '未返回'}）；{row['detail']}"
+            result['reason'] = f"QQ 群 {row['group_id']}；视频卡片已发送（消息 ID：{row.get('card_message_id') or '未返回'}）；{row['detail']}"
         result['summary'] = result['reason'][:100]
         return result
     if kind in {'replies','reply_attempts'}:

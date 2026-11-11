@@ -109,9 +109,7 @@ async def main(args):
         metric_start = len(getattr(adapter, "metrics", []))
         trace = {}
         try:
-            row["polished"] = await asyncio.wait_for(
-                plugin._share_steps(item, context, cfg, trace=trace), timeout=cfg.share.total_timeout_seconds
-            )
+            row["polished"] = await plugin._share_steps(item, context, cfg, trace=trace)
         except Exception as exc:
             row["polished"] = ""
             row["polished_error"] = getattr(exc, "code", type(exc).__name__)

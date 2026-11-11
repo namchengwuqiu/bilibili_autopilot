@@ -19,6 +19,7 @@ from .activity import HistoryHandoff, is_activity_question, query_activity, repl
 from .client import BiliClient, LoginRequired, PlatformError
 from .config import AutopilotConfig
 from .engine import Autopilot, ReadWaiting
+from .miniapp import BILI_ARK_COMMAND, build_bili_ark_request, parse_bili_ark_response, validate_bili_ark
 from .models import (
     DecisionValidationError,
     ModelResponseError,
@@ -31,9 +32,9 @@ from .models import (
     share_prompt,
     support_prompt,
 )
-from .sharing import SHARE_OUTCOMES, VideoSharer
+from .sharing import VideoSharer
 from .state import StateStore
-from .webui import local_time, record_row
+from .webui import local_time, record_row, share_outcome
 
 
 COMMAND_PATTERN = r"^/bili_auto(?:\s+(?P<action>login|preview|replies|start|pause|status|history|logout|ack)(?:\s+(?P<bvid>BV[0-9A-Za-z]{10}))?)?\s*$"
@@ -82,6 +83,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             self.engine.may_publish,
             self._compose_share,
             compose_card=self._compose_card,
+            read_card=self._read_group_card,
         )
         self.engine.share_video = self.sharer.share
         self._share_targets = await self.sharer.targets_summary()
@@ -288,14 +290,52 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             raise ModelResponseError(f"候选模型未返回有效正文：{response_error}；本次跳过，后续有限重查")
         raise ModelTimeoutError("候选模型均超时，本次跳过；自动运行保持开启，下轮继续")
 
+    async def _read_group_card(self, group_id: str, message_id: str) -> Any:
+        # 按真实消息 ID 从群历史回读；SnowLuma 会先向 QQ 拉取该条群消息。
+        response = await self.ctx.api.call(
+            "adapter.napcat.message.get_group_msg_history", version="1",
+            params={"group_id": group_id, "message_id": message_id, "count": 1},
+        )
+        if not isinstance(response, dict) or response.get("status") != "ok" or response.get("retcode") != 0:
+            return None
+        data = response.get("data")
+        messages = data.get("messages") if isinstance(data, dict) else None
+        if not isinstance(messages, list):
+            return None
+        return next((message for message in messages if isinstance(message, dict)
+                     and str(message.get("message_id")) == message_id), None)
+
     async def _compose_card(self, item: VideoItem) -> str:
         if not item.cover.startswith(("https://", "http://")):
             raise ValueError("视频缺少有效封面，无法生成小程序卡片")
-        video_url = f"https://www.bilibili.com/video/{item.bvid}"
+        if item.aid <= 0:
+            raise DecisionValidationError("miniapp_ark", "视频缺少 AV 号，无法定位小程序播放页")
+        # 原生播放页按 AV 号定位，网页目标使用 B 站官方 b23 视频地址。
+        jump_path = f"/pages/video/video?avid={item.aid}"
+        video_url = f"https://b23.tv/{item.bvid}"
+        version = await self.ctx.api.call("adapter.napcat.system.get_version_info", version="1", params={})
+        version_data = version.get("data") if isinstance(version, dict) and version.get("status") == "ok" else None
+        app_name = version_data.get("app_name") if isinstance(version_data, dict) else None
+        if not isinstance(app_name, str) or not app_name:
+            raise DecisionValidationError("miniapp_bridge", "无法识别 QQ 适配服务")
+        if app_name.casefold() == "snowluma":
+            # SnowLuma 的 get_mini_app_ark 封装未将网页目标或正式版本模板编入请求。
+            response = await self.ctx.api.call(
+                "adapter.napcat.system.send_packet", version="1",
+                params={"cmd": BILI_ARK_COMMAND, "rsp": True, "data": build_bili_ark_request(
+                    item.title, item.cover, video_url, jump_path=jump_path, timestamp_ms=time.time_ns() // 1_000_000)},
+            )
+            if not isinstance(response, dict) or response.get("status") != "ok" or response.get("retcode") != 0:
+                raise DecisionValidationError("miniapp_ark", "SnowLuma 未取得 QQ 的卡片签发回执")
+            try:
+                ark = parse_bili_ark_response(response.get("data"), video_url)
+                return json.dumps(ark, ensure_ascii=False, allow_nan=False)
+            except ValueError as exc:
+                raise DecisionValidationError("miniapp_ark", "QQ 未签发包含有效网页目标的 B 站卡片") from exc
         response = await self.ctx.api.call(
             "adapter.napcat.account.get_mini_app_ark", version="1",
             params={"type": "bili", "title": "哔哩哔哩", "desc": item.title,
-                    "picUrl": item.cover, "jumpUrl": video_url},
+                    "picUrl": item.cover, "jumpUrl": jump_path, "webUrl": video_url},
         )
         if not isinstance(response, dict) or response.get("status") != "ok" or response.get("retcode") != 0:
             raise ValueError("QQ 服务未成功生成小程序卡片")
@@ -303,42 +343,37 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         card = data.get("data") if isinstance(data, dict) else None
         if isinstance(card, dict) and "ark" in card:
             card = card["ark"]
-        if isinstance(card, str):
-            card = json.loads(card)
-        if not isinstance(card, dict) or card.get("app") != "com.tencent.miniapp_01" or not card.get("meta"):
-            raise ValueError("QQ 服务返回的小程序卡片格式无效")
-        meta = card["meta"]
-        detail = meta.get("detail_1") if isinstance(meta, dict) else None
-        if not isinstance(detail, dict):
-            raise ValueError("QQ 服务返回的小程序卡片详情格式无效")
-        # 对照正常 B 站分享补网页目标和场景；保留服务端签名、原生地址及已有有效字段。
-        detail = dict(detail)
-        if not detail.get("qqdocurl"):
-            detail["qqdocurl"] = video_url
-        if detail.get("scene") in (None, 0):
-            detail["scene"] = 1036
-        card = {**card, "meta": {**meta, "detail_1": detail}}
-        return json.dumps(card, ensure_ascii=False, allow_nan=False)
+        ark = json.loads(card) if isinstance(card, str) else card
+        validate_bili_ark(ark, video_url)
+        # Ark 由 QQ 服务生成并签名，签发后原样发送；跳转字段应在生成时提供。
+        encoded = json.dumps(ark, ensure_ascii=False, allow_nan=False)
+        return card if isinstance(card, str) else encoded
 
     async def _compose_share(self, uid: str, item: VideoItem, cfg: AutopilotConfig) -> str:
         assert self.engine is not None
         context = await asyncio.to_thread(self.engine.store.share_context, uid, item.bvid)
-        return await asyncio.wait_for(self._share_steps(item, context, cfg), timeout=cfg.share.total_timeout_seconds)
+        return await self._share_steps(item, context, cfg)
 
     async def _share_steps(
         self, item: VideoItem, context: Dict[str, Any], cfg: AutopilotConfig,
         *, trace: Optional[Dict[str, Any]] = None,
     ) -> str:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cfg.share.total_timeout_seconds
+
+        def remaining() -> float:
+            return max(0.0, deadline - loop.time())
+
         # 仅独立预览工具提供 trace；运行账号不会额外保存模型原文。
         def record(**values: Any) -> None:
             if trace is not None:
                 trace.update(values)
 
-        persona = await self._persona()
+        persona = await asyncio.wait_for(self._persona(), timeout=remaining())
         async def verify(text: str, original: str = "") -> None:
             raw = await asyncio.wait_for(
                 self._generate(support_prompt(text, context.get("content_evidence", {}), draft=original), cfg),
-                timeout=cfg.model.review_timeout_seconds,
+                timeout=min(cfg.model.review_timeout_seconds, remaining()),
             )
             review = parse_support(raw)
             record(**{"polish_review" if original else "draft_review": review})
@@ -349,11 +384,12 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         draft_attempts = []
         for attempt in range(2):
             prompt = share_prompt(item, draft_context, persona=persona, extra_style=cfg.model.extra_style)
-            raw = await self._generate(prompt, cfg)
+            raw = await asyncio.wait_for(self._generate(prompt, cfg), timeout=remaining())
             record(draft_raw=raw, result_mode="skipped")
             current_attempt: Dict[str, Any] = {"raw": raw}
             draft_attempts.append(current_attempt)
             record(draft_attempts=draft_attempts)
+            draft = ""
             try:
                 draft = parse_share_text(raw)
                 record(draft=draft)
@@ -367,7 +403,10 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
                 if attempt == 1:
                     raise DecisionValidationError(feedback["code"], feedback["reason"]) from None
                 # 只修正文案一次，仍使用原内容依据并重新复核；不重试消息发送。
+                draft_context.pop("my_comment", None)
+                draft_context.pop("reason", None)
                 draft_context["validation_feedback"] = feedback
+                draft_context["rejected_text"] = draft
                 continue
             if trace is not None:
                 current_attempt["review"] = trace.get("draft_review")
@@ -394,7 +433,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             return text
 
         try:
-            return await asyncio.wait_for(polish(), timeout=cfg.share.polish_timeout_seconds)
+            return await asyncio.wait_for(polish(), timeout=min(cfg.share.polish_timeout_seconds, remaining()))
         except asyncio.CancelledError:
             raise
         except (ValueError, ModelResponseError, asyncio.TimeoutError) as exc:
@@ -525,7 +564,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             "reply_result": self.engine.last_reply_result,
             "share_targets": self._share_targets,
             "share_result": (
-                f"{local_time(last_share['ts'], cfg.browse.timezone)} {SHARE_OUTCOMES.get(last_share['status'], last_share['status'])}："
+                f"{local_time(last_share['ts'], cfg.browse.timezone)} {share_outcome(last_share)}："
                 f"QQ 群 {last_share['group_id']}；{last_share['detail']}"
                 if last_share
                 else "暂无群分享记录；仅新的视频评论提交成功后分享"
