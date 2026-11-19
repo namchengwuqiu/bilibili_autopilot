@@ -2,9 +2,11 @@
 
 from contextlib import contextmanager
 from dataclasses import asdict
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import hashlib
 import json
@@ -112,6 +114,7 @@ class StateStore:
                     id INTEGER PRIMARY KEY, uid TEXT NOT NULL, stage TEXT NOT NULL, ts REAL NOT NULL,
                     elapsed REAL NOT NULL, outcome TEXT NOT NULL, usage TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE INDEX IF NOT EXISTS model_calls_account_time ON model_calls(uid, ts);
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(browse_decisions)")}
             if "selected_bvids" not in columns:
@@ -575,6 +578,37 @@ class StateStore:
                 "elapsed_seconds": round(sum(r["elapsed"] for r in rows), 3),
                 "reported_usage": [json.loads(r["usage"]) for r in rows if r["usage"] != "{}"],
             }
+
+    def daily_model_usage(self, uid: str, now: float, timezone: str) -> List[Dict[str, Any]]:
+        """汇总当前账号含今天在内的七个自然日，保留未上报用量的调用。"""
+        zone = ZoneInfo(timezone)
+        today = datetime.fromtimestamp(now, zone).date()
+        days = [today - timedelta(days=offset) for offset in range(7)]
+        metrics = ("prompt_tokens", "completion_tokens", "total_tokens")
+        report = {
+            day: {"day": day.isoformat(), "calls": 0, "reported_calls": 0, "elapsed_seconds": 0.0,
+                  **dict.fromkeys(metrics)}
+            for day in days
+        }
+        start = datetime(days[-1].year, days[-1].month, days[-1].day, tzinfo=zone).timestamp()
+        with self.connect() as db:
+            for row in db.execute(
+                "SELECT ts, elapsed, usage FROM model_calls WHERE uid=? AND ts>=? AND ts<=?", (uid, start, now)
+            ):
+                daily = report[datetime.fromtimestamp(row["ts"], zone).date()]
+                daily["calls"] += 1
+                daily["elapsed_seconds"] += row["elapsed"]
+                usage = json.loads(row["usage"])
+                reported = False
+                for metric in metrics:
+                    tokens = usage.get(metric)
+                    if type(tokens) in (int, float) and 0 <= tokens < float("inf"):
+                        daily[metric] = (daily[metric] or 0) + int(tokens)
+                        reported = True
+                daily["reported_calls"] += int(reported)
+        for daily in report.values():
+            daily["elapsed_seconds"] = round(daily["elapsed_seconds"], 3)
+        return list(report.values())
 
     def stats(self, uid: str, day_start: float) -> Dict[str, Any]:
         with self.connect() as db:

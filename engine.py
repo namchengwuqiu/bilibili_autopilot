@@ -46,6 +46,9 @@ from .models import (
 from .state import StateStore
 
 
+CANDIDATE_REFILL_THRESHOLD = 6
+
+
 class ReadWaiting(Exception):
     """只读请求等待持久化的下次恢复时间，不改变人工暂停状态。"""
 
@@ -607,7 +610,7 @@ class Autopilot:
         if not stats["last_attempt"] or self.clock() >= until:
             return ""
         when = datetime.fromtimestamp(until, ZoneInfo(cfg.browse.timezone)).strftime("%m-%d %H:%M:%S")
-        return f"评论冷却中，最早 {when} 可再次评论；不影响自主浏览"
+        return f"评论冷却中，最早 {when} 可再次评论"
 
     async def candidate_pool_status(self) -> str:
         cfg = self.get_config()
@@ -733,14 +736,26 @@ class Autopilot:
         remaining = min(cfg.browse.videos_per_round, cfg.browse.videos_per_day - stats["views"])
         if remaining <= 0:
             return "今日视频分析额度已用完"
-        persona = await self.get_persona()
-
-        # 冷却仅限制发送；保留的视频等到可发送时再分析，期间继续探索新视频。
+        # 发送受限时也要检查等待中的候选，只有届时可用的候选才计入补充门槛。
         def eligible(item: VideoItem) -> bool:
             return not self.filter_item(item, cfg)
 
-        pool = (await asyncio.to_thread(self.store.candidates, uid, eligible, self.clock(),
-                                        cfg.browse.backlog_max_items) if mode == "publish" else [])
+        pool = []
+        if mode == "publish":
+            pool = await asyncio.to_thread(
+                self.store.candidates, uid, eligible, self.clock(),
+                cfg.browse.backlog_max_items, ready_only=not until,
+            )
+        if until:
+            available = sum(
+                row["retry_at"] <= until and (not row["expires_at"] or row["expires_at"] > until)
+                for row in pool
+            )
+            if available >= min(CANDIDATE_REFILL_THRESHOLD, cfg.browse.backlog_max_items):
+                reason = "今日评论额度已用完" if quota_full else "评论冷却中"
+                return f"{reason}，候选池已有 {available} 条可用视频，暂缓分析新视频"
+
+        persona = await self.get_persona()
         control = await asyncio.to_thread(self.store.control)
         comment_only = bool(pool and not stats["unresolved"] and not until
                             and float(control.get("candidate_check:" + uid, "0")) <= self.clock())

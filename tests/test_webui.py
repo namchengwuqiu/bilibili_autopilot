@@ -1,7 +1,9 @@
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import asyncio
 import contextlib
@@ -58,6 +60,30 @@ class WebUITests(unittest.IsolatedAsyncioTestCase):
         self.plugin.engine.generate.assert_not_awaited()
         self.assertIsNone(self.plugin._job)
         self.assertNotIn("credential", json.dumps(overview))
+
+    async def test_daily_model_usage_uses_local_dates_and_counts_calls_without_usage(self):
+        midnight = datetime(2026, 11, 19, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+        self.plugin.engine.clock = lambda: midnight + 300
+        store = self.plugin.engine.store
+        store.model_call("1", "candidate", midnight, 2.5, "success",
+                         {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15})
+        store.model_call("1", "candidate", midnight + 1, 1, "cancelled")
+        store.model_call("1", "candidate", midnight - 1, 4, "success", {"total_tokens": 7})
+        store.model_call("1", "candidate", midnight - 7 * 86400, 4, "success", {"total_tokens": 999})
+        store.model_call("2", "candidate", midnight, 4, "success", {"total_tokens": 999})
+
+        overview = await self.plugin.autopilot_overview()
+        rows = overview["daily_model_usage"]
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(rows[0], {"day": "2026-11-19", "calls": 2, "reported_calls": 1, "elapsed_seconds": 3.5,
+                                   "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15})
+        self.assertEqual(rows[1]["day"], "2026-11-18")
+        self.assertEqual(rows[1]["total_tokens"], 7)
+        self.assertIsNone(rows[1]["prompt_tokens"])
+        self.assertEqual(rows[-1]["day"], "2026-11-13")
+        self.assertEqual(rows[-1]["calls"], 0)
+        self.assertIn("今日 2 次", overview["model_usage"])
+        self.plugin.engine.generate.assert_not_awaited()
 
     async def test_page_uses_current_maximum_for_previously_saved_long_wait(self):
         from local_bilibili_autopilot.webui import local_time

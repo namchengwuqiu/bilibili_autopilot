@@ -7,21 +7,21 @@
 - 公开仓库：`https://github.com/namchengwuqiu/bilibili_autopilot`。如果采用其他地址，请同步修改清单、README 和市场登记文案。
 - 作者：sakura桜花（`namchengwuqiu`）。
 - 插件 ID：`local.bilibili-autopilot`，保持不变。修改 ID 会改变配置、账号数据目录及 WebUI 路由。
-- 首个市场准备版本：`0.6.0`；当前版本：`0.8.10`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
+- 首个市场准备版本为 `0.6.0`，当前版本为 `0.8.11`。配置格式版本 `plugin.config_version=0.3.0` 与发行版本用途不同，无需随每次发版修改。
 
 ## 首次发布
 
 1. 在公开仓库默认分支的根目录提交源码和资源，确保 `_manifest.json`、`plugin.py`、`README.md`、`LICENSE` 都位于根目录。
-2. 运行 `python scripts/validate_release.py --tag v0.8.10`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
+2. 运行 `python scripts/validate_release.py --tag v0.8.11`。在安装 `requirements.txt` 所列依赖后，运行 `python scripts/run_tests.py`。
 3. 确认源码仓库不包含 `config.toml`、`config_back/`、登录凭据、二维码、数据库及运行数据。默认示例仅使用 `config.example.toml`。
-4. 创建并推送 `v0.8.10` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
+4. 创建并推送 `v0.8.11` Tag，GitHub Actions 将执行发布检查和模拟测试，随后创建正式 GitHub Release，并附加插件 ZIP 与 SHA256 文件。
 5. 确认 Release 已公开发布，随后按 [市场登记文案](MARKETPLACE_SUBMISSION.md) 在插件中心创建新增插件 Issue。
 6. 等待市场验证、同步及审核收录。只有仓库代码或 Tag 不满足首次登记要求，草稿 Release 也不满足要求。
 
 手动生成用于检查的发布附件：
 
 ```sh
-python scripts/validate_release.py --tag v0.8.10 \
+python scripts/validate_release.py --tag v0.8.11 \
   --archive dist/bilibili-autopilot.zip --notes dist/release-notes.md
 ```
 
@@ -138,3 +138,9 @@ Docker 中运行 293 项隔离测试，291 项通过、2 项按环境条件跳�
 保留实际 config.toml、凭据和最新状态库，升级不会补发历史分享。SnowLuma 通过完整正式模板生成卡片，NapCat 需要支持独立的网页目标字段；缺失签名或视频地址不匹配时明确报错，不修改已签发卡片。旧的网页卡片实验分支不进入本版。
 
 发布前运行完整隔离回归、真实宿主清单校验和固定文件清单打包；检查 ZIP 无私有配置、测试群号、卡片签名、临时报告或数据文件。正式源码中的 tests/ 是隔离回归用例，scripts/preview_shares.py 是可复用的开发工具，均不连接真实发送账号。真实 QQ 验收只使用用户授权的测试群；自动化发布测试不会发送群消息或 B 站评论。
+
+## 0.8.11 升级与验证
+
+本版初步优化模型调用。评论冷却或当天额度用完时，已有足够候选就暂停新分析。更新后可在管理页查看最近 7 天的每日模型用量，并与实际评论数一起观察消耗变化。
+
+保留实际 `config.toml`、登录凭据和最新状态库更新。启动时为已有的调用记录建立查询索引。发布前使用官方麦麦 1.4.7 的清单校验器和原版 WebUI 声明校验器检查安装包，回归测试覆盖冷却、次日额度恢复、即将过期的候选及按自然日汇总的模型用量。

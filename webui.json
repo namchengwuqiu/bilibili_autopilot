@@ -237,6 +237,31 @@
           ]
         },
         {
+          "type": "collapsible",
+          "label": "模型用量（最近 7 天）",
+          "children": [
+            {
+              "type": "text",
+              "value": "按当前 B 站账号和插件时区汇总。调用次数包含失败、超时和取消；Token 只累计麦麦返回的用量，费用以模型服务商账单为准。"
+            },
+            {
+              "type": "table",
+              "value": {
+                "source": "overview",
+                "field": "daily_model_usage"
+              },
+              "columns": [
+                {"field": "day", "label": "日期"},
+                {"field": "calls", "label": "调用次数"},
+                {"field": "reported_calls", "label": "有 Token 用量的调用"},
+                {"field": "prompt_tokens", "label": "输入 Token"},
+                {"field": "completion_tokens", "label": "输出 Token"},
+                {"field": "total_tokens", "label": "总 Token"}
+              ]
+            }
+          ]
+        },
+        {
           "type": "grid",
           "columns": 2,
           "children": [

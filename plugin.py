@@ -532,9 +532,10 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
         reply_last = await asyncio.to_thread(self.engine.store.last_reply_check, uid)
         last_share = await asyncio.to_thread(self.engine.store.latest_share, uid)
         recoveries = await asyncio.to_thread(self.engine.store.recoveries, uid)
-        usage = await asyncio.to_thread(
-            self.engine.store.model_usage, uid, local_day_start(self.engine.clock(), cfg.browse.timezone)
+        daily_usage = await asyncio.to_thread(
+            self.engine.store.daily_model_usage, uid, self.engine.clock(), cfg.browse.timezone
         )
+        usage = daily_usage[0]
         busy = self._job is not None and not self._job.done()
         return {
             "account": f"{self.client.name}（UID {uid}）" if uid else "尚未登录，可在本页扫码登录",
@@ -586,6 +587,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             )
             or "无读取恢复等待",
             "model_usage": f"今日 {usage['calls']} 次，累计 {usage['elapsed_seconds']} 秒；用量由 Host 返回时记录",
+            "daily_model_usage": daily_usage,
             "busy": busy or self.engine.lock.locked(),
             "qr": self._login_qr,
             "commands": {

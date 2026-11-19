@@ -85,6 +85,70 @@ class CandidateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["retry_at"], self.now + 2700)
         self.assertEqual(self.store.stats("1", 0)["attempts"], 1)
 
+    async def test_full_pool_skips_browse_models_and_resumes_at_cooldown_boundary(self):
+        self.cooling()
+        self.cfg.browse.autonomous_enabled = True
+        self.save()
+        for index in range(5):
+            self.save(replace(ITEM, bvid=f"BV{index:010d}"))
+
+        self.assertIn("候选池已有 6 条可用视频", await self.engine.round())
+        self.assertIsNone(self.store.latest_browse_decision("1"))
+        self.client.recommended.assert_not_awaited()
+        self.client.understand.assert_not_awaited()
+        self.generate.assert_not_awaited()
+        self.review.assert_not_awaited()
+        self.client.publish.assert_not_awaited()
+
+        self.now += self.cfg.comment.min_interval_seconds - 10
+        self.assertEqual(await self.engine.next_check_delay(), 10)
+        self.now += 10
+        self.assertIn("已提交评论", await self.engine.round())
+        self.assertEqual(self.generate.await_count, 2)
+        self.review.assert_awaited_once()
+        self.client.publish.assert_awaited_once()
+        self.client.recommended.assert_not_awaited()
+
+    async def test_small_pool_stops_refilling_at_daily_comment_limit(self):
+        self.cooling()
+        self.now += 3600
+        self.cfg.comment.per_day = 1
+        self.cfg.browse.backlog_max_items = 2
+        self.save()
+        self.save(replace(ITEM, bvid="BV0000000001"))
+
+        result = await self.engine.round()
+        self.assertIn("今日评论额度已用完，候选池已有 2 条可用视频", result)
+        self.generate.assert_not_awaited()
+        self.client.recommended.assert_not_awaited()
+        self.client.publish.assert_not_awaited()
+
+        self.now = datetime(2026, 10, 29, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+        self.assertIn("已提交评论", await self.engine.round())
+        self.review.assert_awaited_once()
+        self.client.publish.assert_awaited_once()
+
+    async def test_candidates_expiring_before_next_comment_do_not_block_refill(self):
+        self.cooling()
+        for index in range(5):
+            self.save(replace(ITEM, bvid=f"BV{index:010d}"))
+        self.save(replace(ITEM, bvid="BV0000000005"), ts=self.now - 1800, hours=1)
+
+        self.assertIn("候选保留中", await self.engine.round())
+        self.client.recommended.assert_awaited_once()
+        self.generate.assert_awaited_once()
+        self.review.assert_not_awaited()
+        self.client.publish.assert_not_awaited()
+
+    async def test_manual_preview_still_runs_with_full_waiting_pool(self):
+        self.cooling()
+        for index in range(6):
+            self.save(replace(ITEM, bvid=f"BV{index:010d}"))
+
+        self.assertIn("预览评论", await self.engine.round(preview=True))
+        self.generate.assert_awaited_once()
+        self.client.publish.assert_not_awaited()
+
     async def test_ready_candidate_runs_during_browse_rest_and_without_recommendations(self):
         self.save()
         self.cfg.browse.autonomous_enabled = True
