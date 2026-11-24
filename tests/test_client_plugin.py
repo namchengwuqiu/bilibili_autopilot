@@ -10,7 +10,7 @@ import json
 import time
 import unittest
 
-from bilibili_api import Credential, video
+from bilibili_api import Credential, bvid2aid, video
 
 import httpx
 
@@ -136,6 +136,43 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.payload = {"code": 0, "data": {}}
         with self.assertRaises(UnknownPublish):
             await self.client.publish(ITEM, "测试内容", lambda: True)
+
+    async def test_comment_visibility_compares_public_and_author_reads_without_posting(self):
+        bvid, rpid = "BV1xx411c7mD", "9988"
+        aid = bvid2aid(bvid)
+        visible = {"code": 0, "data": {"root": {"oid": aid, "rpid": int(rpid), "mid": 1}}}
+        missing = {"code": 12006, "message": "没有该评论"}
+        public_calls = []
+        public = missing
+
+        async def lookup(request):
+            public_calls.append(request)
+            return httpx.Response(200, json=public)
+
+        await self.client.public_http.aclose()
+        self.client.public_http = httpx.AsyncClient(
+            cookies={"SESSDATA": "must-not-send"}, transport=httpx.MockTransport(lookup),
+        )
+        self.payload = visible
+        self.assertEqual(await self.client.comment_visibility(bvid, rpid, "1"), "发布账号可查到，公开可见性未确认")
+        self.assertNotIn("cookie", public_calls[0].headers)
+        self.assertIn("SESSDATA=test-only", self.calls[0].headers["cookie"])
+        for request in (public_calls[0], self.calls[0]):
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.url.params["root"], rpid)
+            self.assertEqual(request.url.params["oid"], str(aid))
+
+        public = visible
+        self.assertEqual(await self.client.comment_visibility(bvid, rpid, "1"), "已确认访客可查到")
+        public = {"code": -412, "message": "请求受限"}
+        self.assertIsNone(await self.client.comment_visibility(bvid, rpid, "1"))
+        self.assertEqual(len(self.calls), 1)
+
+        public = missing
+        self.payload = missing
+        self.assertEqual(await self.client.comment_visibility(bvid, rpid, "1"), "公开可见性未确认，发布账号也查不到")
+        self.payload = {"code": 0, "data": {"root": {"oid": aid, "rpid": int(rpid), "mid": 2}}}
+        self.assertEqual(await self.client.comment_visibility(bvid, rpid, "1"), "公开可见性未确认，发布账号查询未能完成")
 
     async def test_pause_while_signing_prevents_post(self):
         entered, release = asyncio.Event(), asyncio.Event()

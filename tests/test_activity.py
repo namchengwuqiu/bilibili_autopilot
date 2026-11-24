@@ -46,6 +46,7 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(preview["draft_comment"], "原来的预览草稿")
         comment = next(r for r in result["records"] if r["kind"] == "comments")
         self.assertTrue(comment["published"])
+        self.assertEqual(comment["public_visibility"], "unchecked")
         self.assertEqual(comment["text"], "实际提交的评论")
         self.assertEqual(comment["rpid"], "9988")
 
@@ -170,6 +171,7 @@ class ActivityToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("主线明明不是谈恋爱", changed["extra_prompt"])
         self.assertIn("兑水喝一辈子", changed["extra_prompt"])
         self.assertIn('"published": true', changed["extra_prompt"])
+        self.assertIn('"public_visibility": "unchecked"', changed["extra_prompt"])
         self.assertIn("不能用生活背景替代", changed["extra_prompt"])
         self.assertTrue(changed["extra_prompt"].startswith(kwargs["extra_prompt"]))
         self.assertEqual(changed["reply_tool_args"], kwargs["reply_tool_args"])

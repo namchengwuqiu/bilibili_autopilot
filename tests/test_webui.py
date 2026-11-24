@@ -85,6 +85,28 @@ class WebUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("今日 2 次", overview["model_usage"])
         self.plugin.engine.generate.assert_not_awaited()
 
+    async def test_check_recent_comment_only_uses_current_accounts_latest_receipt(self):
+        store = self.plugin.engine.store
+        with store.connect() as db:
+            db.executemany("INSERT INTO attempts VALUES (?,?,?,?,?,?,?)", [
+                ("1", ITEM.bvid, 1, "实际提交的评论", "a", "sent", "9988"),
+                ("1", "BV1234567891", 2, "结果未知的评论", "b", "unknown", ""),
+                ("2", "BV1234567892", 3, "别的账号的评论", "c", "sent", "9999"),
+            ])
+        self.client.comment_visibility.return_value = "发布账号可查到，公开可见性未确认"
+        records = await self.plugin.autopilot_records(kind="attempts")
+        self.assertEqual(records["rows"][1]["outcome"], "B 站已接收")
+        self.client.comment_visibility.assert_not_awaited()
+        result = await self.plugin.autopilot_check_comment()
+        self.assertTrue(result["ok"])
+        self.assertIn("评论 ID 9988", result["message"])
+        self.assertIn("发布账号可查到，公开可见性未确认", result["message"])
+        self.assertEqual((await self.plugin.autopilot_overview())["operation"], result["message"])
+        self.client.comment_visibility.assert_awaited_once_with(ITEM.bvid, "9988", "1")
+        self.client.publish.assert_not_awaited()
+        self.plugin.engine.generate.assert_not_awaited()
+        self.assertEqual(await self.plugin.autopilot_records(kind="attempts"), records)
+
     async def test_page_uses_current_maximum_for_previously_saved_long_wait(self):
         from local_bilibili_autopilot.webui import local_time
         await self.plugin.engine.start()

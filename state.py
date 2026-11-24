@@ -1021,6 +1021,14 @@ class StateStore:
             )
             return result.rowcount + replies.rowcount > 0
 
+    def latest_submitted_comment(self, uid: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT bvid,rpid,ts FROM attempts WHERE uid=? AND status='sent' AND rpid!='' "
+                "ORDER BY ts DESC,bvid LIMIT 1", (uid,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def history(self, uid: str) -> str:
         with self.connect() as db:
             rows = db.execute(

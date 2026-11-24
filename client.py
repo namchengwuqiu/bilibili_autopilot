@@ -15,7 +15,7 @@ import re
 import tempfile
 import time
 
-from bilibili_api import Credential, comment, homepage, session, user, video
+from bilibili_api import Credential, bvid2aid, comment, homepage, session, user, video
 from bilibili_api.clients.HTTPXClient import HTTPXClient
 from bilibili_api.exceptions import NetworkException, ResponseCodeException
 from bilibili_api.utils.network import Api
@@ -550,6 +550,56 @@ class BiliClient:
                 continue
             rows.append({"from": start, "to": end, "text": row["content"].strip()})
         return SubtitleText("\n".join(r["text"] for r in rows), rows)
+
+    async def comment_visibility(self, bvid: str, rpid: str, uid: str) -> Optional[str]:
+        """核对一级评论当前的展示情况。接口异常与明确查无此评论使用不同结果。"""
+        if not re.fullmatch(r"BV[0-9A-Za-z]{10}", bvid) or not re.fullmatch(r"[1-9][0-9]*", rpid):
+            return None
+        try:
+            aid = bvid2aid(bvid)
+        except ValueError:
+            return None
+
+        async def lookup(http: httpx.AsyncClient, credential: Optional[Credential] = None) -> Optional[bool]:
+            request = http.build_request(
+                "GET", comment.API["comment"]["sub_reply"]["url"],
+                params={"type": 1, "oid": aid, "root": rpid, "pn": 1, "ps": 1},
+                headers={"User-Agent": "Mozilla/5.0", "Referer": f"https://www.bilibili.com/video/{bvid}/"},
+                timeout=6,
+            )
+            request.headers.pop("cookie", None)
+            if credential is not None:
+                httpx.Cookies(credential.get_cookies()).set_cookie_header(request)
+            try:
+                response = await http.send(request, follow_redirects=False)
+                response.raise_for_status()
+                payload = response.json()
+            except (httpx.HTTPError, ValueError):
+                return None
+            if not isinstance(payload, dict):
+                return None
+            if payload.get("code") == 12006:
+                return False
+            data = payload.get("data")
+            if payload.get("code") == 0 and isinstance(data, dict):
+                root = data.get("root")
+                if (isinstance(root, dict) and str(root.get("rpid")) == rpid
+                        and str(root.get("mid")) == uid and str(root.get("oid")) == str(aid)):
+                    return True
+            return None
+
+        public = await lookup(self.public_http)
+        if public is True:
+            return "已确认访客可查到"
+        if public is None:
+            return None
+        credential = self.credential if self.uid == uid else None
+        author = await lookup(self.http, credential) if credential is not None else None
+        if author is True:
+            return "发布账号可查到，公开可见性未确认"
+        if author is False:
+            return "公开可见性未确认，发布账号也查不到"
+        return "公开可见性未确认，发布账号查询未能完成"
 
     async def publish_reply(self, message: IncomingReply, text: str, can_send: Callable[[], bool]) -> str:
         item = VideoItem(message.bvid, message.aid, "", "", "", 0)

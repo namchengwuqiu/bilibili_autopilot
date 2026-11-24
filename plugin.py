@@ -175,7 +175,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             "query 用简短标题关键词、UP 主名、评论关键词或 BV 号，不要填整句问题。"
             "最近浏览用 browse，已写的评论用 comments，跟进用 replies，综合用 all。"
             "默认查最近7天；需要更早记录可增大 days，0 表示全部历史。"
-            "区分已发送、预览草稿、失败与未知结果，只按返回事实自然回答。"
+            "区分平台已接收、预览草稿、失败与未知结果，仅凭本地回执无法确认公开展示。"
         ),
         parameters={
             "query": {"type": "string", "description": "关键词或 BV 号；留空查询最近记录", "default": ""},
@@ -615,6 +615,26 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             "pagination": data["pagination"],
             "is_reply": kind in {"replies", "reply_attempts"},
         }
+
+    @API("autopilot_check_comment", description="只读核对最近一条一级评论当前是否公开可查", version="1")
+    async def autopilot_check_comment(self) -> Dict[str, Any]:
+        assert self.engine is not None and self.client is not None
+        uid = self.client.uid
+        if not uid:
+            return self._ui_result(False, "尚未登录 B 站账号")
+        row = await asyncio.to_thread(self.engine.store.latest_submitted_comment, uid)
+        if row is None or self.client.uid != uid:
+            return self._ui_result(False, "当前账号没有可核对的评论编号")
+        visibility = await self.client.comment_visibility(row["bvid"], row["rpid"], uid)
+        if self.client.uid != uid:
+            return self._ui_result(False, "核对期间 B 站账号已切换，请重新核对")
+        sent_at = local_time(row["ts"], self.config.browse.timezone)
+        checked_at = local_time(self.engine.clock(), self.config.browse.timezone)
+        return self._ui_result(
+            visibility is not None,
+            f"{row['bvid']}（评论 ID {row['rpid']}，{sent_at} 提交）\n"
+            f"{checked_at} 核对结果：{visibility or '暂时无法核对公开可见性，请稍后再试'}",
+        )
 
     @API("autopilot_command", description="执行 B 站插件自身的管理指令，不执行系统命令", version="1")
     async def autopilot_command(self, command: str) -> Dict[str, Any]:

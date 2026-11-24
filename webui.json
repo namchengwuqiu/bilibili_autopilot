@@ -152,6 +152,10 @@
             }
           }
         },
+        "check_comment": {
+          "api": "autopilot_check_comment",
+          "parameters": {}
+        },
         "execute": {
           "api": "autopilot_command",
           "parameters": {
@@ -495,6 +499,12 @@
               "variant": "primary"
             },
             {
+              "type": "button",
+              "label": "核对最近评论的公开可见性",
+              "action": "check_comment",
+              "variant": "muted"
+            },
+            {
               "type": "text",
               "label": "最近指令结果",
               "format": "log",
@@ -636,7 +646,7 @@
             },
             {
               "type": "text",
-              "value": "表格支持左右滚动，可查看全部字段。"
+              "value": "表格支持左右滚动。「B 站已接收」表示平台返回了评论编号。可在「指令与执行结果」核对最近一条一级评论当前是否公开可查。"
             },
             {
               "type": "table",

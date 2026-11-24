@@ -14,7 +14,7 @@ OUTCOMES = {
     "reading": "正在读取", "read_error": "读取失败", "model_error": "模型调用失败", "model_timeout": "模型超时",
     "content_blocked": "模型服务内容审核拦截",
     "invalid_decision": "判断校验失败", "skipped": "看过不评论 / 跳过", "would_comment": "拟发表评论",
-    "sent": "已提交评论", "rejected": "平台拒绝", "unknown": "发送结果待核对",
+    "sent": "B 站已接收", "rejected": "平台拒绝", "unknown": "发送结果待核对",
     "pending": "发送中", "cancelled": "已取消", "acknowledged": "已人工核对", "blocked": "发送被拦截",
     "deferred": "候选保留中（评论冷却）",
     "quota_wait": "候选保留中（今日额度已满）", "expired": "超过有效期",
