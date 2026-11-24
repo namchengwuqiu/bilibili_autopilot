@@ -16,7 +16,13 @@ import httpx
 
 from local_bilibili_autopilot.client import BiliClient, PlatformError, PublishNotSent, UnknownPublish, subtitle_url
 from local_bilibili_autopilot.config import AutopilotConfig
-from local_bilibili_autopilot.models import IncomingReply, ModelResponseError, ModelTimeoutError, VideoItem
+from local_bilibili_autopilot.models import (
+    IncomingReply,
+    ModelContentBlockedError,
+    ModelResponseError,
+    ModelTimeoutError,
+    VideoItem,
+)
 from local_bilibili_autopilot.plugin import BilibiliAutopilotPlugin
 from local_bilibili_autopilot.state import StateStore
 
@@ -306,6 +312,20 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await plugin._generate("prompt", cfg)
         self.assertEqual(generate.await_count, 1)
+
+    async def test_content_block_does_not_switch_models_or_expose_provider_error(self):
+        plugin = BilibiliAutopilotPlugin()
+        generate = AsyncMock(return_value={
+            "success": False,
+            "error": "Error code: 451 - PRIVATE_PROVIDER_DETAIL",
+        })
+        plugin._ctx = SimpleNamespace(llm=SimpleNamespace(generate=generate))
+        cfg = AutopilotConfig.model_validate({"model": {"candidates": ["first", "second"]}})
+
+        with self.assertRaisesRegex(ModelContentBlockedError, "内容审核拦截") as raised:
+            await plugin._generate("test prompt", cfg)
+        self.assertNotIn("PRIVATE_PROVIDER_DETAIL", str(raised.exception))
+        generate.assert_awaited_once()
 
     async def test_reasoning_only_response_has_actionable_private_error(self):
         plugin = BilibiliAutopilotPlugin()

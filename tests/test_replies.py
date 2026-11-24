@@ -11,7 +11,7 @@ import unittest
 from local_bilibili_autopilot.client import UnknownPublish
 from local_bilibili_autopilot.config import AutopilotConfig
 from local_bilibili_autopilot.engine import Autopilot
-from local_bilibili_autopilot.models import IncomingReply, ModelTimeoutError, parse_reply_decision
+from local_bilibili_autopilot.models import IncomingReply, ModelContentBlockedError, ModelTimeoutError, parse_reply_decision
 from local_bilibili_autopilot.state import StateStore
 
 
@@ -64,6 +64,18 @@ class ReplyEngineTests(unittest.IsolatedAsyncioTestCase):
         self.now += 601
         self.assertIn('已提交跟进回复', await self.engine.reply_round())
         self.client.publish_reply.assert_awaited_once()
+
+    async def test_blocked_reply_is_skipped_on_later_polls(self):
+        self.generate.side_effect = ModelContentBlockedError("模型服务内容审核拦截")
+        self.assertIn("内容审核拦截", await self.engine.reply_round())
+        self.now += 3600
+        await self.engine.reply_round()
+
+        self.generate.assert_awaited_once()
+        self.client.publish_reply.assert_not_awaited()
+        rows = self.store.page_records("1", "replies", "", 1)["rows"]
+        self.assertEqual(rows[0]["decision"]["outcome"], "content_blocked")
+        self.assertEqual(rows[0]["decision"]["retry_at"], 0)
 
     async def test_reply_failures_are_bounded_and_charge_each_analysis(self):
         self.generate.side_effect=ModelTimeoutError('候选模型均超时')

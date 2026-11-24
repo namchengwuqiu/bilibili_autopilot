@@ -15,7 +15,14 @@ import httpx
 from local_bilibili_autopilot.client import BiliClient, PlatformError, VideoReadError
 from local_bilibili_autopilot.config import AutopilotConfig
 from local_bilibili_autopilot.engine import Autopilot
-from local_bilibili_autopilot.models import DecisionValidationError, Evidence, ModelResponseError, VideoItem, parse_decision
+from local_bilibili_autopilot.models import (
+    DecisionValidationError,
+    Evidence,
+    ModelContentBlockedError,
+    ModelResponseError,
+    VideoItem,
+    parse_decision,
+)
 from local_bilibili_autopilot.plugin import BilibiliAutopilotPlugin
 from local_bilibili_autopilot.state import StateStore
 from local_bilibili_autopilot.webui import local_time, record_row
@@ -312,6 +319,40 @@ class EngineRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('已提交评论',await self.engine.round())
         self.assertFalse(self.engine.paused)
         self.assertEqual(self.client.publish.await_args.args[0].bvid,second.bvid)
+
+    async def test_blocked_video_is_terminal_and_does_not_stop_next_video(self):
+        second = replace(ITEM, bvid="BV0987654321")
+        self.client.recommended.return_value = [ITEM, second]
+        self.client.understand.side_effect = [(ITEM, EVIDENCE), (second, EVIDENCE)]
+        self.generate.side_effect = [ModelContentBlockedError("模型服务内容审核拦截"), VALID]
+
+        result = await self.engine.round()
+        self.assertIn("模型服务内容审核拦截", result)
+        self.assertIn("已提交评论", result)
+        row = self.store.page_records("1", "visits", ITEM.bvid, 1)["rows"][0]
+        self.assertEqual(row["outcome"], "content_blocked")
+        self.assertEqual(row["retry_at"], 0)
+        self.assertTrue(self.store.seen("1", ITEM.bvid, "publish", now=self.now + 3600))
+        self.assertEqual(self.store.retry_videos("1", "publish", self.now + 3600), [])
+        self.client.publish.assert_awaited_once()
+        self.assertEqual(self.client.publish.await_args.args[0].bvid, second.bvid)
+
+    async def test_past_comments_stay_local_and_still_prevent_duplicates(self):
+        old_video = "BV0987654321"
+        duplicate = json.loads(VALID)["comment"]
+        self.assertEqual(
+            self.store.reserve("1", old_video, duplicate, self.now - 7200, 0, 12, 0, 0.88),
+            "reserved",
+        )
+        self.store.finish("1", old_video, "sent", "500")
+
+        await self.engine.round()
+        prompt = self.generate.await_args.args[0]
+        self.assertNotIn(duplicate, json.dumps(prompt, ensure_ascii=False))
+        self.assertIn(EVIDENCE.text, prompt[-1]["content"])
+        self.client.publish.assert_not_awaited()
+        row = self.store.page_records("1", "visits", ITEM.bvid, 1)["rows"][0]
+        self.assertEqual(json.loads(row["detail"])["reason"], "duplicate_text")
 
 
 class StoreRecoveryTests(unittest.TestCase):

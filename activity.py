@@ -28,6 +28,7 @@ STATUS_LABELS = {
     "reading": "正在读取，尚未完成",
     "read_error": "读取失败",
     "model_error": "模型调用失败",
+    "content_blocked": "模型服务内容审核拦截",
     "model_timeout": "模型判断超时",
     "invalid_decision": "模型判断未通过校验",
     "blocked": "发布被阻止",

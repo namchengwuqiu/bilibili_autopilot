@@ -751,12 +751,6 @@ class StateStore:
                 for r in reversed(rows)
             ]
 
-    def recent(self, uid: str) -> List[str]:
-        with self.connect() as db:
-            return [
-                row[0] for row in db.execute("SELECT text FROM attempts WHERE uid=? ORDER BY ts DESC LIMIT 30", (uid,))
-            ]
-
     def browse_context(self, uid: str) -> List[Dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(

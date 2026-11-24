@@ -22,6 +22,7 @@ from .engine import Autopilot, ReadWaiting
 from .miniapp import BILI_ARK_COMMAND, build_bili_ark_request, parse_bili_ark_response, validate_bili_ark
 from .models import (
     DecisionValidationError,
+    ModelContentBlockedError,
     ModelResponseError,
     ModelTimeoutError,
     VideoItem,
@@ -250,8 +251,15 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
                         if isinstance(usage.get(key), (int, float)) and not isinstance(usage.get(key), bool)
                     }
                 if isinstance(response, dict) and response.get("success") is False:
-                    # Host 的能力接口将底层异常包装为失败响应；仅识别超时，不公开异常原文。
-                    if re.search(r"timeout|timed[ _-]?out|超时", str(response.get("error", "")), re.I):
+                    # Host 能力接口透传错误描述，插件仅识别错误类别。
+                    error = str(response.get("error", ""))
+                    if re.search(
+                        r'(?:HTTP(?: error)?|error code|status[_ ]code["\']?|状态码|异常响应代码)\s*[:=：]?\s*451\b',
+                        error,
+                        re.I,
+                    ):
+                        raise ModelContentBlockedError("模型服务内容审核拦截（HTTP 451）")
+                    if re.search(r"timeout|timed[ _-]?out|超时", error, re.I):
                         raise ModelTimeoutError("模型调用超时")
                 result = self._model_text(response)
                 outcome = "success"
@@ -262,6 +270,8 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             except (asyncio.TimeoutError, httpx.TimeoutException, ModelTimeoutError):
                 outcome = "timeout"
                 reason = "调用超时"
+            except ModelContentBlockedError:
+                raise
             except ModelResponseError as exc:
                 response_error = exc
                 reason = str(exc)

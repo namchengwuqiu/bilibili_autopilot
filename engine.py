@@ -25,6 +25,7 @@ from .client import (
 from .config import AutopilotConfig
 from .models import (
     DecisionValidationError,
+    ModelContentBlockedError,
     ModelResponseError,
     ModelTimeoutError,
     VideoItem,
@@ -351,6 +352,13 @@ class Autopilot:
                     reason,
                 )
                 lines.append(f"{message.bvid} 收到的回复 {message.source_rpid}：{reason}，等待有限重查")
+                continue
+            except ModelContentBlockedError as exc:
+                await asyncio.to_thread(
+                    self.store.decide_reply, uid, message.source_rpid, mode, self.clock(),
+                    "content_blocked", "", str(exc),
+                )
+                lines.append(f"{message.bvid} 跟进跳过：{exc}")
                 continue
             except (asyncio.TimeoutError, ModelResponseError) as exc:
                 reason = str(exc) if isinstance(exc, ModelResponseError) else "模型判断超时"
@@ -848,7 +856,6 @@ class Autopilot:
             else:
                 chosen = old[:slots] + fresh + old[slots:]
         items = chosen
-        recent = await asyncio.to_thread(self.store.recent, uid)
         lines: List[str] = []
         commented_item = None
         up_counts: Dict[str, int] = {}
@@ -921,7 +928,6 @@ class Autopilot:
                 interests=cfg.browse.interests,
                 extra_style=cfg.model.extra_style,
                 max_chars=cfg.comment.max_chars,
-                recent=recent,
                 candidate_only=candidate_only,
             )
             try:
@@ -1013,6 +1019,10 @@ class Autopilot:
                     lines.append(f"{item.bvid} 跳过：补充字幕临时失败，未产生发送意图")
                     continue
                 raise
+            except ModelContentBlockedError as exc:
+                await self.record(uid, item, mode, "content_blocked", str(exc))
+                lines.append(f"{item.bvid} 跳过：{exc}")
+                continue
             except ModelResponseError as exc:
                 await self.record(uid, item, mode, "model_error", str(exc))
                 lines.append(f"{item.bvid} 跳过：{exc}；后台保持运行，等待有限重查")
