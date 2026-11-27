@@ -9,7 +9,7 @@ import asyncio
 import json
 import unittest
 
-from local_bilibili_autopilot.client import PlatformError, UnknownPublish
+from local_bilibili_autopilot.client import BiliClient, PlatformError, UnknownPublish
 from local_bilibili_autopilot.config import AutopilotConfig
 from local_bilibili_autopilot.engine import Autopilot
 from local_bilibili_autopilot.models import (Evidence, IncomingReply, ModelResponseError, ModelTimeoutError, VideoItem, active_time, local_day_start,
@@ -133,6 +133,34 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         records = self.store.page_records(self.client.uid, "visits", bad.bvid, 1)["rows"]
         self.assertEqual(records[0]["outcome"], "read_error")
         self.assertIn("code=-504", records[0]["detail"])
+
+    async def test_private_videos_are_skipped_when_reading_info_or_enriching_subtitles(self):
+        self.client.mock_add_spec(BiliClient)
+        private_at_info = replace(ITEM, bvid="BV0987654321", up_uid="3101")
+        private_at_subtitles = replace(ITEM, bvid="BV0987654322", up_uid="3102")
+        self.client.recommended.return_value = [private_at_info, private_at_subtitles, ITEM]
+        self.client.understand.side_effect = [
+            PlatformError("读取视频信息", 62012),
+            (private_at_subtitles, replace(EVIDENCE, source="AI 摘要", cid=20)),
+            (ITEM, EVIDENCE),
+        ]
+        self.client.enrich.side_effect = PlatformError("补充相关字幕列表", 62012)
+
+        await self.engine.start()
+        result = await self.engine.round()
+
+        self.assertFalse(self.engine.paused)
+        self.assertIn("已提交评论", result)
+        self.client.enrich.assert_awaited_once()
+        self.client.publish.assert_awaited_once()
+        self.assertEqual(self.client.publish.await_args.args[0], ITEM)
+        for video in (private_at_info, private_at_subtitles):
+            with self.subTest(bvid=video.bvid):
+                row = self.store.page_records(self.client.uid, "visits", video.bvid, 1)["rows"][0]
+                self.assertEqual(row["outcome"], "skipped")
+                self.assertIn("仅 UP 主可见", row["detail"])
+                self.assertIn("62012", row["detail"])
+                self.assertEqual(row["retry_at"], 0)
 
     async def test_read_timeout_skips_without_publishing_or_pausing(self):
         self.client.understand.side_effect = asyncio.TimeoutError()

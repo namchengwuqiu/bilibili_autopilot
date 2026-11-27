@@ -605,6 +605,18 @@ class Autopilot:
         detail = json.dumps(fields, ensure_ascii=False)
         await asyncio.to_thread(self.store.visit, uid, item.bvid, mode, self.clock(), outcome, detail, retryable)
 
+    async def _handle_video_read_rejection(self, uid: str, item: VideoItem, mode: str, error: PlatformError) -> str:
+        if error.code == 62012:
+            reason = f"{error.operation}：视频仅 UP 主可见（code={error.code}）"
+            await self.record(uid, item, mode, "skipped", reason)
+        else:
+            reason = str(error)
+            retryable = error.code == -504
+            await self.record(uid, item, mode, "read_error", reason, retryable=retryable)
+            if not retryable:
+                raise error
+        return f"{item.bvid} 跳过：{reason}"
+
     def publication_hold(self, stats: Dict[str, Any]) -> str:
         if not stats["unresolved"]:
             return ""
@@ -885,11 +897,8 @@ class Autopilot:
             try:
                 item, evidence = await self.client.understand(item, cfg.model.content_max_chars)
             except PlatformError as exc:
-                await self.record(uid, item, mode, "read_error", str(exc), retryable=exc.code == -504)
-                if exc.code == -504:
-                    lines.append(f"{item.bvid} 跳过：读取视频内容返回 code=-504，继续处理其他视频")
-                    continue
-                raise
+                lines.append(await self._handle_video_read_rejection(uid, item, mode, exc))
+                continue
             except VideoReadError as exc:
                 await self.record(uid, item, mode, "read_error", str(exc), retryable=exc.retryable)
                 lines.append(f"{item.bvid} 已跳过：{exc}")
@@ -1014,11 +1023,8 @@ class Autopilot:
                 lines.append(f"{item.bvid} 跳过：补充字幕失败，未产生发送意图")
                 continue
             except PlatformError as exc:
-                await self.record(uid, item, mode, "read_error", f"补充字幕：{exc}", retryable=exc.code == -504)
-                if exc.code == -504:
-                    lines.append(f"{item.bvid} 跳过：补充字幕临时失败，未产生发送意图")
-                    continue
-                raise
+                lines.append(await self._handle_video_read_rejection(uid, item, mode, exc))
+                continue
             except ModelContentBlockedError as exc:
                 await self.record(uid, item, mode, "content_blocked", str(exc))
                 lines.append(f"{item.bvid} 跳过：{exc}")
