@@ -23,7 +23,7 @@ from bilibili_api.utils.network import Api
 import httpx
 import qrcode
 
-from .models import Evidence, IncomingReply, VideoItem, normalized, recommendations
+from .models import Evidence, IncomingReply, VideoItem, normalized, recommendations, subtitle_time_label
 from .transport import api_transport
 
 
@@ -137,14 +137,19 @@ def select_subtitles(rows: List[Dict[str, Any]], max_chars: int, topic: str = ""
     # 先给三个覆盖位置留空间，避免一条过长字幕独占预算。
     per_segment = max(20, max_chars // 4)
     for i in order:
-        if max_chars - used < 10:
+        remaining = max_chars - used - int(bool(selected))
+        if remaining <= len("[00:00-00:00] "):
             break
         row = rows[i]
-        text = row["text"][: min(per_segment, max_chars - used)]
+        prefix_length = len(subtitle_time_label(row)) + 1
+        allowance = min(per_segment, remaining) - prefix_length
+        if allowance <= 0:
+            continue
+        text = row["text"][:allowance].strip()
         if not text:
             continue
+        used += int(bool(selected)) + prefix_length + len(text)
         selected.append({"source": "subtitle", "from": row["from"], "to": row["to"], "text": text})
-        used += len(text) + 1
     selected.sort(key=lambda r: (r["from"], r["to"]))
     return "\n".join(r["text"] for r in selected), selected
 
@@ -372,7 +377,7 @@ class BiliClient:
                         continue
                     parent = own[target]
                     bvid = parent["bvid"]
-                    aid = video.Video(bvid=bvid).get_aid()
+                    aid = bvid2aid(bvid)
                     source = int(item.get("source_id", 0))
                     uid = str(int(sender.get("mid", 0)))
                     timestamp = float(row.get("reply_time", 0))
@@ -512,13 +517,24 @@ class BiliClient:
         text = await self._read_stage("补充相关字幕文件", self._subtitle_text(subtitle_url(entries[0]["subtitle_url"])))
         rows = text.segments if isinstance(text, SubtitleText) else []
         # 同一轮字幕已经有相关引用时复用；摘要候选才按评论主题补读，不读取画面或音频。
-        summary_budget = min(len(evidence.text), max_chars // 3) if "摘要" in evidence.source else 0
-        sampled, selected = select_subtitles(rows, max_chars - summary_budget, topic)
+        # 摘要本身较短时完整保留，避免截断后误伤第一轮基于摘要摘录的 evidence_quote。
+        prefix = "摘要："
+        separator = "\n字幕："
+        if "摘要" in evidence.source:
+            reserve_for_subtitles = max(200, max_chars // 2)
+            max_summary = max(max_chars // 3, max_chars - reserve_for_subtitles - len(prefix) - len(separator))
+            summary_budget = min(len(evidence.text), max(0, max_summary))
+            # 展示带时间标签的片段时，“字幕：”之后还有一个换行。
+            subtitle_budget = max_chars - summary_budget - len(prefix) - len(separator) - 1
+        else:
+            summary_budget = 0
+            subtitle_budget = max_chars
+        sampled, selected = select_subtitles(rows, subtitle_budget, topic)
         if not sampled:
-            sampled = text.strip()[: max_chars - summary_budget]
+            sampled = text.strip()[:subtitle_budget]
         if len(sampled.strip()) < 30:
             return evidence
-        combined = ("摘要：" + evidence.text[:summary_budget] + "\n字幕：" if summary_budget else "") + sampled
+        combined = (prefix + evidence.text[:summary_budget] + separator if summary_budget else "") + sampled
         return Evidence(
             "AI 摘要与相关字幕" if summary_budget else "相关字幕",
             combined[:max_chars],

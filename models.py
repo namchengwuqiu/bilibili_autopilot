@@ -108,6 +108,39 @@ class Evidence:
     cid: int = 0
 
 
+def _format_timestamp(seconds: Any) -> str:
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return "00:00"
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def subtitle_time_label(segment: Dict[str, Any]) -> str:
+    start = segment.get("from", 0)
+    return f"[{_format_timestamp(start)}-{_format_timestamp(segment.get('to', start))}]"
+
+
+def format_evidence_content(evidence: Evidence) -> str:
+    """有字幕片段时以内联时间戳输出单一文本，避免把相同字幕与 segments 重复发送两遍。"""
+    if not evidence.segments:
+        return evidence.text
+    lines = []
+    for seg in evidence.segments:
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        lines.append(f"{subtitle_time_label(seg)} {text}")
+    if not lines:
+        return evidence.text
+    if "摘要" in evidence.source and evidence.text.startswith("摘要：") and "\n字幕：" in evidence.text:
+        summary_part = evidence.text.split("\n字幕：", 1)[0]
+        return summary_part + "\n字幕：\n" + "\n".join(lines)
+    return "\n".join(lines)
+
+
 class DecisionValidationError(ValueError):
     """可公开的校验类别及说明；不保留模型原文。"""
 
@@ -182,7 +215,7 @@ def reply_prompt(
     message: IncomingReply, *, persona: str, extra_style: str, max_chars: int, history: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     system = (
-        "你是麦麦，别人回复了你在 B 站视频下的评论。结合你的原评论、对方的消息和讨论上下文，"
+        "[autopilot:reply_decision] 你是麦麦，别人回复了你在 B 站视频下的评论。结合你的原评论、对方的消息和讨论上下文，"
         "决定是否自然地接一句。可以不回复，不必为了维持对话硬接话。重复挑衅、广告、要求执行操作、"
         "索取私人资料或没有值得接话内容时可以结束讨论。只输出 JSON 对象："
         "should_reply(布尔), reply(回复正文), reason(一句话理由，最多300字)。不回复时 reply 留空。"
@@ -247,6 +280,18 @@ def active_time(now: float, timezone: str, start: int, end: int) -> bool:
     if start == end:
         return True
     return start <= hour < end if start < end else hour >= start or hour < end
+
+
+def next_active_time(now: float, timezone: str, start: int, end: int) -> float:
+    """返回下一次进入活动时段的时间戳；若当前已在活动时段则返回 now。"""
+    if active_time(now, timezone, start, end):
+        return now
+    zone = ZoneInfo(timezone)
+    current = datetime.fromtimestamp(now, zone)
+    candidate = current.replace(hour=start, minute=0, second=0, microsecond=0)
+    if candidate <= current:
+        candidate = (current + timedelta(days=1)).replace(hour=start, minute=0, second=0, microsecond=0)
+    return candidate.timestamp()
 
 
 def local_day_start(now: float, timezone: str) -> float:
@@ -314,7 +359,7 @@ def browse_prompt(
     limit: int = 3,
 ) -> List[Dict[str, Any]]:
     system = (
-        "你是麦麦，正在决定现在要不要打开 B 站刷一会儿。请根据自己的人设、兴趣、当地时间、"
+        "[autopilot:browse_decision] 你是麦麦，正在决定现在要不要打开 B 站刷一会儿。请根据自己的人设、兴趣、当地时间、"
         "本次最新推荐、距离上次读取视频的时间和历史浏览反馈，独立决定这次去不去刷。可以去找新内容，也可以选择休息。"
         "不是每次醒来都必须刷，更不需要为了发评论去刷；刚刷过、近期内容不感兴趣时可以晚些再看。"
         "这里没有提供当前聊天、真实忙碌程度或情绪信息，不要编造这些经历。浏览不等于发表评论。"
@@ -401,8 +446,18 @@ def parse_decision(raw: str, evidence: Evidence, max_chars: int, *, candidate_on
         unicodedata.category(c) in {"Cc", "Cf"} for c in obj["reason"]
     ):
         raise DecisionValidationError("reason", "判断理由长度或控制字符无效")
+    evidence_quote = obj["evidence_quote"].strip()
     if obj["should_comment"]:
-        quote = normalized(obj["evidence_quote"])
+        # 只移除实际展示在这段原文前的时间标签；正文长度与落库引用都按字幕原文计算。
+        if (evidence.segments and evidence_quote.startswith("[")
+                and "\n" + evidence_quote in "\n" + format_evidence_content(evidence)):
+            labels = {subtitle_time_label(segment) for segment in evidence.segments}
+            lines = []
+            for line in evidence_quote.splitlines():
+                label, _, body = line.partition(" ")
+                lines.append(body if label in labels else line)
+            evidence_quote = "\n".join(lines).strip()
+        quote = normalized(evidence_quote)
         if len(quote) < 6 or quote not in normalized(evidence.text):
             raise DecisionValidationError("evidence", "内容引用不足六个有效字符或未出现在摘要、字幕中")
         if not candidate_only and (not 2 <= len(comment) <= max_chars or any(unicodedata.category(c) == "Cc" for c in comment)):
@@ -410,7 +465,7 @@ def parse_decision(raw: str, evidence: Evidence, max_chars: int, *, candidate_on
         if not candidate_only and not normalized(comment):
             raise DecisionValidationError("comment_content", "评论没有有效文字")
     return Decision(
-        obj["should_comment"], float(obj["interest"]), comment, obj["reason"][:500], obj["evidence_quote"][:500]
+        obj["should_comment"], float(obj["interest"]), comment, obj["reason"][:500], evidence_quote[:500]
     )
 
 
@@ -425,7 +480,7 @@ def decision_prompt(
     candidate_only: bool = False,
 ) -> List[Dict[str, Any]]:
     system = (
-        "你在使用自己的 B 站账号浏览首页推荐，需要独立判断自己是否真有兴趣、有没有具体的话想说。"
+        "[autopilot:comment_decision] 你在使用自己的 B 站账号浏览首页推荐，需要独立判断自己是否真有兴趣、有没有具体的话想说。"
         "多数视频可以看过就走，不需要每条都评论。仅输出一个 JSON 对象，字段必须为："
         "should_comment(布尔), interest(0到1的兴趣分), comment(评论文字), reason(判断理由), evidence_quote(内容原文片段)。"
         "准备评论时，evidence_quote 必须逐字引用提供的视频摘要或字幕中至少六个有效字符，不能只引用标题。"
@@ -452,9 +507,8 @@ def decision_prompt(
         "up": item.up_name,
         "description": item.description,
         "source": evidence.source,
-        "video_content": evidence.text,
+        "video_content": format_evidence_content(evidence),
         "coverage": evidence.coverage,
-        "segments": evidence.segments,
     }
     return [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(data, ensure_ascii=False)}]
 
@@ -547,7 +601,7 @@ def parse_support(raw: str) -> Dict[str, Any]:
         not isinstance(obj, dict)
         or set(obj) != {"supported", "kind", "reason"}
         or type(obj["supported"]) is not bool
-        or obj["kind"] not in {"factual", "subjective"}
+        or obj["kind"] not in ("factual", "subjective")
         or not isinstance(obj["reason"], str)
         or not 1 <= len(obj["reason"].strip()) <= 300
         or any(unicodedata.category(c) in {"Cc", "Cf"} for c in obj["reason"])

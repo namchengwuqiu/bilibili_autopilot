@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs
@@ -216,6 +217,36 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PluginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unload_waits_for_in_flight_database_cleanup(self):
+        with TemporaryDirectory() as folder:
+            plugin = BilibiliAutopilotPlugin()
+            plugin.set_plugin_config({})
+            plugin._ctx = SimpleNamespace(
+                paths=SimpleNamespace(data_dir=folder), chat=AsyncMock(), send=AsyncMock(),
+                logger=SimpleNamespace(info=lambda *args: None),
+            )
+            entered, release = asyncio.Event(), Event()
+            loop = asyncio.get_running_loop()
+            original = StateStore.clean_evidence
+
+            def slow_cleanup(store, now):
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(timeout=5):
+                    raise TimeoutError("测试清理任务未释放")
+                original(store, now)
+
+            with patch.object(StateStore, "clean_evidence", slow_cleanup), \
+                    patch("local_bilibili_autopilot.plugin.BiliClient", return_value=AsyncMock()):
+                await plugin.on_load()
+                await asyncio.wait_for(entered.wait(), timeout=2)
+                unload = asyncio.create_task(plugin.on_unload())
+                try:
+                    done, _ = await asyncio.wait({unload}, timeout=0.05)
+                    self.assertFalse(done)
+                finally:
+                    release.set()
+                    await unload
+
     async def test_saved_login_starts_scheduler_without_start_command(self):
         with TemporaryDirectory() as folder:
             client = AsyncMock()

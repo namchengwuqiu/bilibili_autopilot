@@ -26,10 +26,12 @@ class StateStore:
         self.path = path
 
     @contextmanager
-    def connect(self):
+    def connect(self, *, durable: bool = False):
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         try:
+            # 对外发送前的占位和回执需要抵抗断电，统计与浏览记录使用 WAL 的 NORMAL 模式。
+            conn.execute("PRAGMA synchronous=FULL" if durable else "PRAGMA synchronous=NORMAL")
             with conn:
                 yield conn
         finally:
@@ -40,7 +42,8 @@ class StateStore:
     ) -> None:
         now = time.time() if now is None else now
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
+            db.execute("PRAGMA journal_mode=WAL")
             seed_analyses = not db.execute("SELECT 1 FROM sqlite_master WHERE name='analyses'").fetchone()
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -210,6 +213,9 @@ class StateStore:
                     "SELECT uid,'reply',cast(source_rpid AS TEXT),mode,ts FROM reply_decisions"
                 )
             db.execute("CREATE INDEX IF NOT EXISTS visits_updated ON visits(uid,updated_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS visits_lookup ON visits(uid,mode,outcome,retry_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS attempts_status ON attempts(uid,status)")
+            db.execute("CREATE INDEX IF NOT EXISTS reply_attempts_status ON reply_attempts(uid,status)")
             # 请求发出前已落盘；进程中断后无法知道平台是否接收，绝不重试该视频。
             db.execute("UPDATE attempts SET status='unknown' WHERE status='pending'")
             db.execute("UPDATE reply_attempts SET status='unknown' WHERE status='pending'")
@@ -256,7 +262,7 @@ class StateStore:
                 )
 
     def set_pause(self, paused: bool, reason: str, kind: str = "error") -> None:
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
             db.executemany(
                 "INSERT OR REPLACE INTO meta VALUES (?, ?)",
                 [
@@ -267,7 +273,7 @@ class StateStore:
             )
 
     def reserve_share(self, uid: str, bvid: str, group_id: str, ts: float, title: str) -> bool:
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
             db.execute("BEGIN IMMEDIATE")
             if not db.execute(
                 "SELECT 1 FROM attempts WHERE uid=? AND bvid=? AND status='sent' AND rpid!=''", (uid, bvid)
@@ -280,7 +286,7 @@ class StateStore:
             return cursor.rowcount == 1
 
     def finish_share(self, uid: str, bvid: str, group_id: str, status: str, detail: str, message_id: str = "") -> None:
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
             db.execute(
                 "UPDATE video_shares SET status=?,detail=?,message_id=? WHERE uid=? AND bvid=? AND group_id=?",
                 (status, detail[:500], message_id, uid, bvid, group_id),
@@ -293,7 +299,7 @@ class StateStore:
 
     def mark_share_card_sent(self, uid: str, bvid: str, group_id: str, message_id: str) -> None:
         """卡片确认后立即落盘，第二条消息中断也保留已成功的第一步。"""
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
             db.execute(
                 "UPDATE video_shares SET card_sent=1,card_message_id=?,message_id=?,"
                 "detail='卡片已发送，等待发送分享感想' WHERE uid=? AND bvid=? AND group_id=? AND status='pending'",
@@ -362,6 +368,22 @@ class StateStore:
                     "INSERT INTO analyses(uid,kind,item_id,mode,ts) VALUES (?,'video',?,?,?)", (uid, bvid, mode, ts)
                 )
 
+    @staticmethod
+    def _visit_row_seen(row: Any, include_deferred: bool, check_deadline: bool, now: float) -> bool:
+        if row["outcome"] == "quota_wait":
+            return (include_deferred and row["expires_at"] > 0) or row["retry_at"] > now or (
+                row["expires_at"] > 0 and row["expires_at"] <= now
+            )
+        if row["outcome"] == "blocked" and row["detail"] == "cooldown":
+            return include_deferred and row["retry_at"] > now
+        if row["outcome"] == "deferred":
+            return include_deferred or (
+                check_deadline and (row["retry_at"] > now or (row["expires_at"] > 0 and row["expires_at"] <= now))
+            )
+        return not (
+            row["outcome"] in RETRY_OUTCOMES and row["failures"] < MAX_FAILURES and 0 < row["retry_at"] <= now
+        )
+
     def seen(self, uid: str, bvid: str, mode: str, include_deferred: bool = False, now: Optional[float] = None) -> bool:
         check_deadline = now is not None
         now = time.time() if now is None else now
@@ -371,19 +393,42 @@ class StateStore:
             row = db.execute("SELECT * FROM visits WHERE uid=? AND bvid=? AND mode=?", (uid, bvid, mode)).fetchone()
             if row is None:
                 return False
-            if row["outcome"] == "quota_wait":
-                return (include_deferred and row["expires_at"] > 0) or row["retry_at"] > now or (
-                    row["expires_at"] > 0 and row["expires_at"] <= now
+            return self._visit_row_seen(row, include_deferred, check_deadline, now)
+
+    def unseen_bvids(
+        self, uid: str, bvids: List[str], mode: str, include_deferred: bool = False, now: Optional[float] = None
+    ) -> set[str]:
+        """单次连接批量筛选未处理或已到重查时间的 BV 号，避免逐条开关连接。"""
+        unique = list(dict.fromkeys(bvids))
+        if not unique:
+            return set()
+        check_deadline = now is not None
+        now = time.time() if now is None else now
+        placeholders = ",".join("?" for _ in unique)
+        with self.connect() as db:
+            attempted = {
+                row[0]
+                for row in db.execute(
+                    f"SELECT bvid FROM attempts WHERE uid=? AND bvid IN ({placeholders})",
+                    (uid, *unique),
                 )
-            if row["outcome"] == "blocked" and row["detail"] == "cooldown":
-                return include_deferred and row["retry_at"] > now
-            if row["outcome"] == "deferred":
-                return include_deferred or (
-                    check_deadline and (row["retry_at"] > now or (row["expires_at"] > 0 and row["expires_at"] <= now))
+            }
+            remaining = [bvid for bvid in unique if bvid not in attempted]
+            if not remaining:
+                return set()
+            placeholders = ",".join("?" for _ in remaining)
+            visit_rows = {
+                row["bvid"]: row
+                for row in db.execute(
+                    f"SELECT * FROM visits WHERE uid=? AND mode=? AND bvid IN ({placeholders})",
+                    (uid, mode, *remaining),
                 )
-            return not (
-                row["outcome"] in RETRY_OUTCOMES and row["failures"] < MAX_FAILURES and 0 < row["retry_at"] <= now
-            )
+            }
+        return {
+            bvid
+            for bvid in remaining
+            if bvid not in visit_rows or not self._visit_row_seen(visit_rows[bvid], include_deferred, check_deadline, now)
+        }
 
     def retry_videos(
         self, uid: str, mode: str, now: float, eligible: Optional[Callable[[VideoItem], bool]] = None
@@ -560,6 +605,18 @@ class StateStore:
     def clean_evidence(self, now: float) -> None:
         with self.connect() as db:
             db.execute("DELETE FROM evidence_cache WHERE expires_at<=?", (now,))
+
+    def prune_logs(self, now: float, retention_days: int = 30, *, decision_retention_days: int = 0) -> None:
+        """定期清理调用统计；仅在指定保留天数时清理自主决定。"""
+        with self.connect() as db:
+            if 0 < retention_days < now / 86400:
+                db.execute("DELETE FROM model_calls WHERE ts<?", (now - retention_days * 86400,))
+            if 0 < decision_retention_days < now / 86400:
+                db.execute(
+                    "DELETE FROM browse_decisions WHERE ts<? AND id NOT IN "
+                    "(SELECT max(id) FROM browse_decisions GROUP BY uid)",
+                    (now - decision_retention_days * 86400,),
+                )
 
     def model_call(
         self, uid: str, stage: str, now: float, elapsed: float, outcome: str, usage: Optional[Dict[str, Any]] = None
@@ -801,6 +858,85 @@ class StateStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def overview_snapshot(self, uid: str, now: float, timezone: str, day_start: float) -> Dict[str, Any]:
+        """单次连接读取管理页概览所需的全部只读统计，减少频繁轮询时的连接开销。"""
+        zone = ZoneInfo(timezone)
+        today = datetime.fromtimestamp(now, zone).date()
+        days = [today - timedelta(days=offset) for offset in range(7)]
+        metrics = ("prompt_tokens", "completion_tokens", "total_tokens")
+        report = {
+            day: {"day": day.isoformat(), "calls": 0, "reported_calls": 0, "elapsed_seconds": 0.0,
+                  **dict.fromkeys(metrics)}
+            for day in days
+        }
+        start = datetime(days[-1].year, days[-1].month, days[-1].day, tzinfo=zone).timestamp()
+        with self.connect() as db:
+            views = db.execute(
+                "SELECT count(*) FROM analyses WHERE uid=? AND kind='video' AND ts>=?", (uid, day_start)
+            ).fetchone()[0]
+            attempts = db.execute("SELECT count(*) FROM attempts WHERE uid=? AND ts>=?", (uid, day_start)).fetchone()[0]
+            unresolved = [
+                r[0]
+                for r in db.execute("SELECT bvid FROM attempts WHERE uid=? AND status IN ('pending','unknown')", (uid,))
+            ]
+            last = db.execute("SELECT coalesce(max(ts),0) FROM attempts WHERE uid=?", (uid,)).fetchone()[0]
+            unresolved += [
+                r[0]
+                for r in db.execute(
+                    "SELECT bvid FROM reply_attempts WHERE uid=? AND status IN ('pending','unknown')", (uid,)
+                )
+            ]
+            reply_attempts = db.execute(
+                "SELECT count(*) FROM reply_attempts WHERE uid=? AND ts>=?", (uid, day_start)
+            ).fetchone()[0]
+            reply_analyses = db.execute(
+                "SELECT count(*) FROM analyses WHERE uid=? AND kind='reply' AND ts>=?", (uid, day_start)
+            ).fetchone()[0]
+            reply_last_attempt = db.execute(
+                "SELECT coalesce(max(ts),0) FROM reply_attempts WHERE uid=?", (uid,)
+            ).fetchone()[0]
+            choice_row = db.execute(
+                "SELECT ts,should_browse,reason,next_check_at,selected_bvids FROM browse_decisions "
+                "WHERE uid=? ORDER BY id DESC LIMIT 1",
+                (uid,),
+            ).fetchone()
+            reply_poll_row = db.execute("SELECT last_checked FROM reply_poll WHERE uid=?", (uid,)).fetchone()
+            share_row = db.execute("SELECT * FROM video_shares WHERE uid=? ORDER BY ts DESC LIMIT 1", (uid,)).fetchone()
+            recoveries = [
+                dict(row) for row in db.execute("SELECT * FROM read_recovery WHERE uid=? ORDER BY retry_at", (uid,))
+            ]
+            for row in db.execute(
+                "SELECT ts, elapsed, usage FROM model_calls WHERE uid=? AND ts>=? AND ts<=?", (uid, start, now)
+            ):
+                daily = report[datetime.fromtimestamp(row["ts"], zone).date()]
+                daily["calls"] += 1
+                daily["elapsed_seconds"] += row["elapsed"]
+                usage = json.loads(row["usage"])
+                reported = False
+                for metric in metrics:
+                    tokens = usage.get(metric)
+                    if type(tokens) in (int, float) and 0 <= tokens < float("inf"):
+                        daily[metric] = (daily[metric] or 0) + int(tokens)
+                        reported = True
+                daily["reported_calls"] += int(reported)
+        for daily in report.values():
+            daily["elapsed_seconds"] = round(daily["elapsed_seconds"], 3)
+        return {
+            "stats": {
+                "views": views,
+                "attempts": attempts,
+                "unresolved": sorted(set(unresolved)),
+                "last_attempt": max(last, reply_last_attempt),
+                "reply_attempts": reply_attempts,
+                "reply_analyses": reply_analyses,
+            },
+            "choice": dict(choice_row) if choice_row else None,
+            "reply_last": reply_poll_row[0] if reply_poll_row else 0,
+            "last_share": dict(share_row) if share_row else None,
+            "recoveries": recoveries,
+            "daily_usage": list(report.values()),
+        }
+
     def page_records(self, uid: str, kind: str, search: str, page: int) -> Dict[str, Any]:
         """仅返回当前账号的分页记录；动态 SQL 只使用固定的表、列定义。"""
         sources = {
@@ -885,7 +1021,7 @@ class StateStore:
         self, uid: str, bvid: str, text: str, now: float, day_start: float, limit: int, cooldown: int, similarity: float
     ) -> str:
         """在同一事务中验证限额并占用发送机会，跨进程也不会重复发送。"""
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT value FROM meta WHERE key='paused'").fetchone()[0] != "0":
                 return "paused"
@@ -897,8 +1033,7 @@ class StateStore:
                 return "unresolved"
             if db.execute("SELECT 1 FROM attempts WHERE uid=? AND bvid=?", (uid, bvid)).fetchone():
                 return "duplicate_video"
-            rows = db.execute("SELECT ts, text FROM attempts WHERE uid=? ORDER BY ts DESC", (uid,)).fetchall()
-            if sum(row["ts"] >= day_start for row in rows) >= limit:
+            if db.execute("SELECT count(*) FROM attempts WHERE uid=? AND ts>=?", (uid, day_start)).fetchone()[0] >= limit:
                 return "daily_limit"
             all_rows = db.execute(
                 "SELECT ts,text FROM attempts WHERE uid=? UNION ALL "
@@ -934,7 +1069,7 @@ class StateStore:
         thread_limit: int,
         similarity: float,
     ) -> str:
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT value FROM meta WHERE key='paused'").fetchone()[0] != "0":
                 return "paused"
@@ -995,7 +1130,7 @@ class StateStore:
     def finish_reply(self, uid: str, source_rpid: int, status: str, rpid: str = "") -> None:
         if status not in {"sent", "rejected", "unknown", "cancelled"}:
             raise ValueError("invalid reply attempt status")
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
             db.execute(
                 "UPDATE reply_attempts SET status=?,rpid=? WHERE uid=? AND source_rpid=? AND status='pending'",
                 (status, rpid, uid, source_rpid),
@@ -1004,14 +1139,14 @@ class StateStore:
     def finish(self, uid: str, bvid: str, status: str, rpid: str = "") -> None:
         if status not in {"sent", "rejected", "unknown", "cancelled"}:
             raise ValueError("invalid attempt status")
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
             db.execute(
                 "UPDATE attempts SET status=?,rpid=? WHERE uid=? AND bvid=? AND status='pending'",
                 (status, rpid, uid, bvid),
             )
 
     def acknowledge(self, uid: str, bvid: str) -> bool:
-        with self.connect() as db:
+        with self.connect(durable=True) as db:
             result = db.execute(
                 "UPDATE attempts SET status='acknowledged' WHERE uid=? AND bvid=? AND status='unknown'", (uid, bvid)
             )

@@ -33,7 +33,9 @@ from .models import (
     browse_prompt,
     candidate_selection_prompt,
     decision_prompt,
+    format_evidence_content,
     local_day_start,
+    next_active_time,
     next_local_day,
     normalized,
     parse_browse_decision,
@@ -48,6 +50,18 @@ from .state import StateStore
 
 
 CANDIDATE_REFILL_THRESHOLD = 6
+
+
+async def generate_decision(
+    prompt: Any, cfg: AutopilotConfig, parse: Callable[[str], Any], budget: float,
+    generate: Callable[..., Awaitable[str]], generate_validated: Optional[Callable[..., Awaitable[Any]]],
+) -> Any:
+    """宿主逐候选校验；注入的单模型适配器复用同一解析器与总时限。"""
+    if budget <= 0:
+        raise asyncio.TimeoutError
+    if generate_validated is None:
+        return parse(await asyncio.wait_for(generate(prompt, cfg), timeout=budget))
+    return await asyncio.wait_for(generate_validated(prompt, cfg, parse=parse, budget=budget), timeout=budget)
 
 
 class ReadWaiting(Exception):
@@ -65,12 +79,14 @@ class Autopilot:
         clock: Callable[[], float] = time.time,
         share_video: Optional[Callable[[str, VideoItem], Awaitable[str]]] = None,
         review: Optional[Callable[[Any, AutopilotConfig], Awaitable[str]]] = None,
+        generate_validated: Optional[Callable[..., Awaitable[Any]]] = None,
     ):
         self.client, self.store = client, store
         self.get_config, self.generate, self.get_persona = get_config, generate, get_persona
         self.clock = clock
         self.share_video = share_video
         self.review = review
+        self.generate_validated = generate_validated
         self._selected_bvids: List[str] = []
         self.lock = asyncio.Lock()
         self._control_lock = asyncio.Lock()
@@ -158,19 +174,23 @@ class Autopilot:
 
     async def next_check_delay(self) -> float:
         cfg = self.get_config()
+        now = self.clock()
+        if not self.paused and not self.active(cfg):
+            wake_at = next_active_time(now, cfg.browse.timezone, cfg.browse.active_start_hour, cfg.browse.active_end_hour)
+            return min(3600, max(1, wake_at - now))
         delay = cfg.browse.interval_seconds
         if not self.paused and cfg.browse.autonomous_enabled and self.active(cfg):
             choice = await asyncio.to_thread(self.store.latest_browse_decision, self.client.uid)
-            if choice and self.next_check_time(choice, cfg) > self.clock():
-                delay = max(1, self.next_check_time(choice, cfg) - self.clock())
+            if choice and self.next_check_time(choice, cfg) > now:
+                delay = max(1, self.next_check_time(choice, cfg) - now)
         if not self.paused and cfg.replies.enabled and self.client.uid and self.active(cfg):
             last = await asyncio.to_thread(self.store.last_reply_check, self.client.uid)
-            delay = min(delay, max(1, last + cfg.replies.interval_seconds - self.clock()))
+            delay = min(delay, max(1, last + cfg.replies.interval_seconds - now))
         if (not self.paused and cfg.comment.publish_enabled and self.client.uid and self.active(cfg)):
             stats = await asyncio.to_thread(self.store.stats, self.client.uid,
-                                           local_day_start(self.clock(), cfg.browse.timezone))
+                                           local_day_start(now, cfg.browse.timezone))
             pool = await asyncio.to_thread(self.store.candidates, self.client.uid,
-                                          lambda item: not self.filter_item(item, cfg), self.clock(),
+                                          lambda item: not self.filter_item(item, cfg), now,
                                           cfg.browse.backlog_max_items, ready_only=False)
             if pool and not stats["unresolved"] and stats["views"] < cfg.browse.videos_per_day:
                 control = await asyncio.to_thread(self.store.control)
@@ -178,14 +198,14 @@ class Autopilot:
                 due = max(min(row["retry_at"] for row in pool),
                           float(control.get("candidate_check:" + self.client.uid, "0")),
                           stats["last_attempt"] + cfg.comment.min_interval_seconds if stats["last_attempt"] else 0,
-                          next_local_day(self.clock(), cfg.browse.timezone) if stats["attempts"] >= cfg.comment.per_day else 0,
+                          next_local_day(now, cfg.browse.timezone) if stats["attempts"] >= cfg.comment.per_day else 0,
                           account_wait["retry_at"] if account_wait else 0)
-                delay = min(delay, max(1, due - self.clock()))
+                delay = min(delay, max(1, due - now))
         waits = await asyncio.to_thread(self.store.recoveries, self.client.uid)
-        waits = [w for w in waits if w["retry_at"] > self.clock() and (w["stage"] != "replies" or cfg.replies.enabled)]
+        waits = [w for w in waits if w["retry_at"] > now and (w["stage"] != "replies" or cfg.replies.enabled)]
         if waits:
             # 未到期的回复轮次不能把退避等待变成每秒空转。
-            delay = min(delay, max(1, min(w["retry_at"] for w in waits) - self.clock()))
+            delay = min(delay, max(1, min(w["retry_at"] for w in waits) - now))
         return delay
 
     async def _read(self, stage: str, operation: Callable[[], Awaitable[Any]], cfg: AutopilotConfig) -> Any:
@@ -337,7 +357,7 @@ class Autopilot:
                     lambda raw: parse_reply_decision(raw, cfg.comment.max_chars),
                     preview,
                     lambda d: d.should_reply,
-                    lambda d: self._check_support(d.reply, content, cfg),
+                    lambda d, deadline: self._check_support(d.reply, content, cfg, deadline),
                 )
             except DecisionValidationError as exc:
                 reason = f"跟进回复校验失败 [{exc.code}]：{exc}"
@@ -512,7 +532,13 @@ class Autopilot:
             limit=cfg.browse.videos_per_round,
         )
         try:
-            raw = await self._generate_model(prompt, cfg)
+            decision = await generate_decision(
+                prompt, cfg,
+                lambda raw: parse_browse_decision(raw, min_minutes, cfg.browse.max_check_minutes,
+                                                  candidates, cfg.browse.videos_per_round),
+                cfg.model.timeout_seconds * len(cfg.model.attempts(fast=True)) + 5,
+                self.generate, self.generate_validated,
+            )
         except (asyncio.TimeoutError, ModelTimeoutError):
             now = self.clock()
             await asyncio.to_thread(
@@ -532,10 +558,6 @@ class Autopilot:
             )
             self.last_result = reason
             return False
-        try:
-            decision = parse_browse_decision(
-                raw, min_minutes, cfg.browse.max_check_minutes, candidates, cfg.browse.videos_per_round
-            )
         except (ValueError, TypeError) as exc:
             # 格式不完整时不擅自去浏览；下次检查时重新判断，不自动修补模型原文。
             now = self.clock()
@@ -664,21 +686,23 @@ class Autopilot:
 
     async def _generate_model(self, prompt: Any, cfg: AutopilotConfig) -> str:
         # 单模型时限由生成器执行；外层只限制整组候选的总等待时间。
-        timeout = cfg.model.timeout_seconds * max(1, len(cfg.model.candidates)) + 5
+        timeout = cfg.model.timeout_seconds * len(cfg.model.attempts()) + 5
         return await asyncio.wait_for(self.generate(prompt, cfg), timeout=timeout)
 
-    async def _check_support(self, text: str, evidence: Dict[str, Any], cfg: AutopilotConfig) -> Dict[str, Any]:
+    async def _check_support(
+        self, text: str, evidence: Dict[str, Any], cfg: AutopilotConfig, deadline: Optional[float] = None,
+    ) -> Dict[str, Any]:
         prompt = support_prompt(text, evidence)
+        budget = cfg.model.review_timeout_seconds
+        if deadline is not None:
+            budget = min(budget, deadline - asyncio.get_running_loop().time())
         try:
-            if self.review is None:
-                raw = await asyncio.wait_for(
-                    self._generate_model(prompt, cfg), timeout=cfg.model.review_timeout_seconds
-                )
-            else:
-                raw = await asyncio.wait_for(self.review(prompt, cfg), timeout=cfg.model.review_timeout_seconds)
+            result = await generate_decision(
+                prompt, cfg, parse_support, budget, self.review or self.generate,
+                self.generate_validated if self.review is None else None,
+            )
         except (asyncio.TimeoutError, ModelTimeoutError):
             raise ModelTimeoutError("正文依据复核超时，未产生发送意图") from None
-        result = parse_support(raw)
         if not result["supported"]:
             raise DecisionValidationError("unsupported_body", result["reason"])
         return result
@@ -690,10 +714,11 @@ class Autopilot:
         parse: Callable[[str], Any],
         preview: bool,
         should_review: Optional[Callable[[Any], bool]] = None,
-        check: Optional[Callable[[Any], Awaitable[Any]]] = None,
+        check: Optional[Callable[[Any, float], Awaitable[Any]]] = None,
     ) -> Any:
         return await asyncio.wait_for(
-            self._decision_steps(prompt, cfg, parse, preview, should_review, check),
+            self._decision_steps(prompt, cfg, parse, preview, should_review, check,
+                                 asyncio.get_running_loop().time() + cfg.model.decision_budget_seconds),
             timeout=cfg.model.decision_budget_seconds,
         )
 
@@ -704,7 +729,8 @@ class Autopilot:
         parse: Callable[[str], Any],
         preview: bool,
         should_review: Optional[Callable[[Any], bool]],
-        check: Optional[Callable[[Any], Awaitable[Any]]],
+        check: Optional[Callable[[Any, float], Awaitable[Any]]],
+        deadline: float,
     ) -> Any:
         for attempt in range(2):
             raw = await self._generate_model(prompt, cfg)
@@ -713,7 +739,7 @@ class Autopilot:
                 if should_review is not None and check is not None and should_review(decision):
                     if self.get_config() != cfg or (not preview and (self.paused or not self.active(cfg))):
                         raise DecisionValidationError("cancelled", "正文复核前已暂停或配置发生变化")
-                    await check(decision)
+                    await check(decision, deadline)
                 return decision
             except DecisionValidationError as exc:
                 if (
@@ -734,6 +760,328 @@ class Autopilot:
                     },
                 ]
         raise AssertionError("模型判断重试次数异常")
+
+    async def _select_candidate_item(
+        self, uid: str, cfg: AutopilotConfig, pool: List[Dict[str, Any]], persona: str
+    ) -> tuple[Optional[List[VideoItem]], str]:
+        shortlist = pool[:10]
+        next_check = self.clock() + cfg.browse.interval_seconds
+        # 先保存下一检查时间，取消、超时与重启都不能使选择模型密集重跑。
+        await asyncio.to_thread(self.store.set_meta, "candidate_check:" + uid, str(next_check))
+        try:
+            selected, selection_reason = await generate_decision(
+                candidate_selection_prompt(shortlist, persona, self.clock()), cfg,
+                lambda raw: parse_candidate_selection(raw, shortlist), cfg.model.decision_budget_seconds,
+                self.generate, self.generate_validated,
+            )
+        except (ValueError, ModelResponseError, asyncio.TimeoutError) as exc:
+            return None, f"候选选择未完成：{type(exc).__name__}；下次检查再考虑，未尝试发送"
+        if self.get_config() != cfg or not self.may_publish():
+            return None, "候选选择期间已暂停或配置、活动时段变化，未尝试发送"
+        await asyncio.to_thread(
+            self.store.record_candidate_selection, uid, shortlist, selected, selection_reason, self.clock(), next_check
+        )
+        if not selected:
+            return None, "本次未选中候选，继续保留：" + selection_reason
+        return [row["item"] for row in shortlist if row["bvid"] == selected], ""
+
+    async def _plan_round_items(
+        self,
+        uid: str,
+        cfg: AutopilotConfig,
+        stats: Dict[str, Any],
+        persona: str,
+        mode: str,
+        preview: bool,
+        remaining: int,
+        eligible: Callable[[VideoItem], bool],
+    ) -> tuple[Optional[List[VideoItem]], str]:
+        retries = await asyncio.to_thread(self.store.retry_videos, uid, mode, self.clock(), eligible)
+        saved = list({item.bvid: item for item in retries}.values())
+        self._selected_bvids = []
+        items: Optional[List[VideoItem]] = None
+        if not preview and cfg.browse.autonomous_enabled:
+            choice = await asyncio.to_thread(self.store.latest_browse_decision, uid)
+            if choice and self.next_check_time(choice, cfg) > self.clock():
+                return None, "尚未到下次自主浏览检查时间"
+            # 到期后只先读取推荐元数据。决定去刷之前不读取字幕、调用内容模型或发送评论。
+            items = await self._read("recommendations", self.client.recommended, cfg)
+            items = saved + [item for item in items if item.bvid not in {v.bvid for v in saved}]
+            filtered = [item for item in items if not self.filter_item(item, cfg)]
+            unseen = await asyncio.to_thread(
+                self.store.unseen_bvids,
+                uid,
+                [item.bvid for item in filtered],
+                mode,
+                include_deferred=True,
+                now=self.clock(),
+            )
+            candidates = [item for item in filtered if item.bvid in unseen]
+            # 候选评论独立处理；浏览窗口分给失败重查与新推荐。
+            retry_ids = {x.bvid for x in retries}
+            saved_ids = {x.bvid for x in saved}
+            lanes = [
+                [v for v in candidates if v.bvid in retry_ids],
+                [v for v in candidates if v.bvid not in saved_ids],
+            ]
+            present = [lane for lane in lanes if lane]
+            turn_key = "candidate_turn:" + uid
+            turn = int((await asyncio.to_thread(self.store.control)).get(turn_key, "0"))
+            if present:
+                shift = turn % len(present)
+                present = present[shift:] + present[:shift]
+                candidates = []
+                while present and len(candidates) < 10:
+                    for lane in present:
+                        if lane and len(candidates) < 10:
+                            candidates.append(lane.pop(0))
+                    present = [lane for lane in present if lane]
+                if remaining == 1:
+                    # 单项轮次轮流开放一个来源，仍由模型决定是否有兴趣。
+                    candidates = candidates[:1]
+                await asyncio.to_thread(self.store.set_meta, turn_key, str(turn + 1))
+            if self.paused or not self.get_config().plugin.enabled or self.get_config() != cfg or not self.active(cfg):
+                return None, "读取推荐期间已暂停或配置、活动时段变化，本轮不浏览"
+            if not await self._want_to_browse(uid, cfg, stats, persona, candidates):
+                return None, self.last_result
+            by_id = {item.bvid: item for item in candidates}
+            items = [by_id[bvid] for bvid in self._selected_bvids] if self._selected_bvids else candidates
+            if self.paused or not self.get_config().plugin.enabled or self.get_config() != cfg or not self.active(cfg):
+                return None, "自主判断期间已暂停或配置、活动时段变化，本轮不浏览"
+        if items is None:
+            items = await self._read("recommendations", self.client.recommended, cfg)
+            items = saved + [item for item in items if item.bvid not in {v.bvid for v in saved}]
+        # 有积压时保留新内容机会。单视频轮次交替，其余轮次最多给积压一半位置。
+        chosen = list(items)
+        saved_ids = {v.bvid for v in saved}
+        old = [v for v in chosen if v.bvid in saved_ids]
+        fresh = [v for v in chosen if v.bvid not in saved_ids]
+        if old and fresh and not self._selected_bvids:
+            slots = max(1, remaining // 2)
+            if remaining == 1:
+                turn_key = "queue_turn:" + uid
+                turn = (await asyncio.to_thread(self.store.control)).get(turn_key, "new")
+                chosen = old + fresh if turn == "saved" else fresh + old
+                await asyncio.to_thread(self.store.set_meta, turn_key, "new" if turn == "saved" else "saved")
+            else:
+                chosen = old[:slots] + fresh + old[slots:]
+        return chosen, ""
+
+    async def _evaluate_video(
+        self,
+        uid: str,
+        item: VideoItem,
+        evidence: Any,
+        cfg: AutopilotConfig,
+        persona: str,
+        mode: str,
+        preview: bool,
+        candidate_only: bool,
+    ) -> tuple[Optional[Any], Any, str]:
+        prompt = decision_prompt(
+            item,
+            evidence,
+            persona=persona,
+            interests=cfg.browse.interests,
+            extra_style=cfg.model.extra_style,
+            max_chars=cfg.comment.max_chars,
+            candidate_only=candidate_only,
+        )
+        try:
+
+            async def review_comment(d: Any, deadline: float) -> Any:
+                nonlocal evidence
+                if isinstance(self.client, BiliClient) and evidence.cid > 0 and "摘要" in evidence.source:
+                    evidence = await self.client.enrich(
+                        item, evidence, d.comment + " " + d.evidence_quote, cfg.model.content_max_chars
+                    )
+                    # 保留 title/up/description 元数据，避免复核失败重生成时上下文残缺。
+                    base_payload = json.loads(prompt[-1]["content"])
+                    base_payload.update(
+                        source=evidence.source,
+                        video_content=format_evidence_content(evidence),
+                        coverage=evidence.coverage,
+                    )
+                    base_payload.pop("segments", None)
+                    prompt[-1]["content"] = json.dumps(base_payload, ensure_ascii=False)
+                if any(
+                    word.strip() and word.casefold() in evidence.text.casefold()
+                    for word in cfg.browse.blocked_keywords
+                ):
+                    raise DecisionValidationError("blocked_content", "补充字幕命中屏蔽关键词")
+                await self._check_support(
+                    d.comment,
+                    {
+                        "source": evidence.source,
+                        "text": format_evidence_content(evidence),
+                        "coverage": evidence.coverage,
+                    },
+                    cfg, deadline,
+                )
+                # 再验证引用与补充内容一致；原摘要已被完整替换时，不能沿用不存在的引用。
+                parse_decision(
+                    json.dumps(
+                        {
+                            "should_comment": d.should_comment,
+                            "interest": d.interest,
+                            "comment": d.comment,
+                            "reason": d.reason,
+                            "evidence_quote": d.evidence_quote,
+                        }
+                    ),
+                    evidence,
+                    cfg.comment.max_chars,
+                )
+
+            decision = await self._model_decision(
+                prompt,
+                cfg,
+                lambda raw: parse_decision(raw, evidence, cfg.comment.max_chars, candidate_only=candidate_only),
+                preview,
+                lambda d: not candidate_only and d.should_comment and d.interest >= cfg.comment.min_interest,
+                review_comment,
+            )
+            return decision, evidence, ""
+        except DecisionValidationError as exc:
+            reason = f"模型输出校验失败 [{exc.code}]：{exc}"
+            await self.record(
+                uid,
+                item,
+                mode,
+                "invalid_decision",
+                json.dumps(
+                    {
+                        "reason": reason,
+                        "validation_error": exc.code,
+                        "source": evidence.source,
+                        "read_warning": evidence.read_warning,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            return None, evidence, f"{item.bvid} 跳过：{reason}；等待有限重查"
+        except (asyncio.TimeoutError, ModelTimeoutError) as exc:
+            reason = str(exc) if isinstance(exc, ModelTimeoutError) else "评论生成与依据复核总时限已到"
+            await self.record(uid, item, mode, "model_timeout", reason)
+            return None, evidence, f"{item.bvid} 模型判断超时：{reason}；本轮跳过，下轮继续，最多重查两次"
+        except VideoReadError as exc:
+            await self.record(uid, item, mode, "read_error", f"补充字幕：{exc}", retryable=exc.retryable)
+            return None, evidence, f"{item.bvid} 跳过：补充字幕失败，未产生发送意图"
+        except PlatformError as exc:
+            return None, evidence, await self._handle_video_read_rejection(uid, item, mode, exc)
+        except ModelContentBlockedError as exc:
+            await self.record(uid, item, mode, "content_blocked", str(exc))
+            return None, evidence, f"{item.bvid} 跳过：{exc}"
+        except ModelResponseError as exc:
+            await self.record(uid, item, mode, "model_error", str(exc))
+            return None, evidence, f"{item.bvid} 跳过：{exc}；后台保持运行，等待有限重查"
+        except Exception as exc:
+            await self.record(uid, item, mode, "model_error", f"模型调用失败：{type(exc).__name__}")
+            raise
+
+    async def _publish_video_comment(
+        self,
+        uid: str,
+        item: VideoItem,
+        decision: Any,
+        detail: str,
+        cfg: AutopilotConfig,
+        mode: str,
+        day_start: float,
+    ) -> tuple[str, str]:
+        """执行发布前最终检查、事务占用与单次发布；返回 (状态动作, 摘要文本)。"""
+        # 所有长耗时操作结束后重新读取配置，暂停/关闭发布会在这里生效。
+        if not self.may_publish():
+            await self.record(uid, item, mode, "cancelled", "运行中已暂停、关闭发布或离开活动时段")
+            return "stop", ""
+        current = self.get_config()
+        if current != cfg:
+            await self.record(uid, item, mode, "cancelled", "生成评论期间配置已变化，下轮重新判断")
+            return "stop", ""
+        if (
+            self.filter_item(item, current)
+            or len(decision.comment) > current.comment.max_chars
+            or decision.interest < current.comment.min_interest
+        ):
+            await self.record(uid, item, mode, "cancelled", "运行中筛选配置发生变化")
+            return "continue", ""
+        now = self.clock()
+        reserved = await asyncio.to_thread(
+            self.store.reserve,
+            uid,
+            item.bvid,
+            decision.comment,
+            now,
+            local_day_start(now, current.browse.timezone),
+            current.comment.per_day,
+            current.comment.min_interval_seconds,
+            current.comment.similarity_threshold,
+        )
+        if reserved != "reserved":
+            fields = json.loads(detail)
+            fields.update(block_reason=reserved, decision_reason=fields["reason"], reason=reserved)
+            outcome = "blocked"
+            if reserved in {"cooldown", "daily_limit"}:
+                outcome = "deferred" if reserved == "cooldown" else "quota_wait"
+                fields["video"] = {
+                    "bvid": item.bvid,
+                    "aid": item.aid,
+                    "title": item.title,
+                    "up_uid": item.up_uid,
+                    "up_name": item.up_name,
+                    "duration": item.duration,
+                }
+                latest = await asyncio.to_thread(self.store.stats, uid, day_start)
+                retry_at = max(
+                    next_local_day(now, current.browse.timezone)
+                    if latest["attempts"] >= current.comment.per_day
+                    else 0,
+                    latest["last_attempt"] + current.comment.min_interval_seconds,
+                )
+                fields["reason"] = (
+                    "daily_limit" if reserved == "daily_limit" else self.comment_cooldown(latest, current)
+                )
+                await asyncio.to_thread(
+                    self.store.wait_video,
+                    uid,
+                    item,
+                    now,
+                    json.dumps(fields, ensure_ascii=False),
+                    retry_at,
+                    current.browse.backlog_max_age_hours,
+                    current.browse.backlog_max_items,
+                    outcome,
+                )
+            else:
+                await self.record(uid, item, mode, outcome, json.dumps(fields, ensure_ascii=False))
+            line = f"{item.bvid} 未发布：{fields['reason']}"
+            return ("continue" if reserved in {"cooldown", "daily_limit"} else "stop"), line
+        if not self.may_publish():
+            await asyncio.to_thread(self.store.finish, uid, item.bvid, "cancelled")
+            await self.record(uid, item, mode, "cancelled", "发布前已暂停")
+            return "stop", ""
+        try:
+            rpid = await self.client.publish(
+                item, decision.comment, lambda: self.may_publish() and self.get_config() == cfg
+            )
+        except asyncio.CancelledError:
+            # pending 已经持久化，重新加载时会转为 unknown 并阻止再次发送。
+            raise
+        except PlatformError:
+            await asyncio.to_thread(self.store.finish, uid, item.bvid, "rejected")
+            await self.record(uid, item, mode, "rejected", detail)
+            raise
+        except (LoginRequired, PublishNotSent):
+            await asyncio.to_thread(self.store.finish, uid, item.bvid, "cancelled")
+            await self.record(uid, item, mode, "cancelled", detail)
+            raise
+        except Exception:
+            await asyncio.to_thread(self.store.finish, uid, item.bvid, "unknown")
+            await self.record(uid, item, mode, "unknown", detail)
+            raise UnknownPublish(f"{item.bvid} 的评论结果待核对，不会自动重试") from None
+        await asyncio.to_thread(self.store.finish, uid, item.bvid, "sent", rpid)
+        await self.record(uid, item, mode, "sent", detail)
+        return "sent", f"{item.bvid} 已提交评论（rpid={rpid}）：{decision.comment}"
 
     async def _round(self, preview: bool) -> str:
         cfg = self.get_config().model_copy(deep=True)
@@ -779,95 +1127,17 @@ class Autopilot:
         control = await asyncio.to_thread(self.store.control)
         comment_only = bool(pool and not stats["unresolved"] and not until
                             and float(control.get("candidate_check:" + uid, "0")) <= self.clock())
-        items = None
         if comment_only:
-            shortlist = pool[:10]
-            next_check = self.clock() + cfg.browse.interval_seconds
-            # 先保存下一检查时间，取消、超时与重启都不能使选择模型密集重跑。
-            await asyncio.to_thread(self.store.set_meta, "candidate_check:" + uid, str(next_check))
-            try:
-                raw = await asyncio.wait_for(
-                    self._generate_model(candidate_selection_prompt(shortlist, persona, self.clock()), cfg),
-                    timeout=cfg.model.decision_budget_seconds,
-                )
-                selected, selection_reason = parse_candidate_selection(raw, shortlist)
-            except (ValueError, ModelResponseError, asyncio.TimeoutError) as exc:
-                return f"候选选择未完成：{type(exc).__name__}；下次检查再考虑，未尝试发送"
-            if self.get_config() != cfg or not self.may_publish():
-                return "候选选择期间已暂停或配置、活动时段变化，未尝试发送"
-            await asyncio.to_thread(self.store.record_candidate_selection, uid, shortlist, selected,
-                                    selection_reason, self.clock(), next_check)
-            if not selected:
-                return "本次未选中候选，继续保留：" + selection_reason
-            items = [row["item"] for row in shortlist if row["bvid"] == selected]
+            items, message = await self._select_candidate_item(uid, cfg, pool, persona)
+            if items is None:
+                return message
             remaining = 1
-        retries = await asyncio.to_thread(self.store.retry_videos, uid, mode, self.clock(), eligible)
-        saved = list({item.bvid: item for item in retries}.values())
-        self._selected_bvids = []
-        if not comment_only and not preview and cfg.browse.autonomous_enabled:
-            choice = await asyncio.to_thread(self.store.latest_browse_decision, uid)
-            if choice and self.next_check_time(choice, cfg) > self.clock():
-                return "尚未到下次自主浏览检查时间"
-            # 到期后只先读取推荐元数据。决定去刷之前不读取字幕、调用内容模型或发送评论。
-            items = await self._read("recommendations", self.client.recommended, cfg)
-            items = saved + [item for item in items if item.bvid not in {v.bvid for v in saved}]
-            candidates = []
-            for item in items:
-                if not self.filter_item(item, cfg) and not await asyncio.to_thread(
-                    self.store.seen, uid, item.bvid, mode, include_deferred=not comment_only, now=self.clock()
-                ):
-                    candidates.append(item)
-            # 候选评论独立处理；浏览窗口分给失败重查与新推荐。
-            lanes = [
-                [
-                    v
-                    for v in candidates
-                    if v.bvid in {x.bvid for x in retries}
-                ],
-                [v for v in candidates if v.bvid not in {x.bvid for x in saved}],
-            ]
-            present = [lane for lane in lanes if lane]
-            turn_key = "candidate_turn:" + uid
-            turn = int((await asyncio.to_thread(self.store.control)).get(turn_key, "0"))
-            if present:
-                shift = turn % len(present)
-                present = present[shift:] + present[:shift]
-                candidates = []
-                while present and len(candidates) < 10:
-                    for lane in present:
-                        if lane and len(candidates) < 10:
-                            candidates.append(lane.pop(0))
-                    present = [lane for lane in present if lane]
-                if remaining == 1:
-                    # 单项轮次轮流开放一个来源，仍由模型决定是否有兴趣。
-                    candidates = candidates[:1]
-                await asyncio.to_thread(self.store.set_meta, turn_key, str(turn + 1))
-            if self.paused or not self.get_config().plugin.enabled or self.get_config() != cfg or not self.active(cfg):
-                return "读取推荐期间已暂停或配置、活动时段变化，本轮不浏览"
-            if not await self._want_to_browse(uid, cfg, stats, persona, candidates):
-                return self.last_result
-            by_id = {item.bvid: item for item in candidates}
-            items = [by_id[bvid] for bvid in self._selected_bvids] if self._selected_bvids else candidates
-            if self.paused or not self.get_config().plugin.enabled or self.get_config() != cfg or not self.active(cfg):
-                return "自主判断期间已暂停或配置、活动时段变化，本轮不浏览"
-        if items is None:
-            items = await self._read("recommendations", self.client.recommended, cfg)
-            items = saved + [item for item in items if item.bvid not in {v.bvid for v in saved}]
-        # 有积压时保留新内容机会。单视频轮次交替，其余轮次最多给积压一半位置。
-        chosen = list(items)
-        saved_ids = {v.bvid for v in saved}
-        old = [v for v in chosen if v.bvid in saved_ids]
-        fresh = [v for v in chosen if v.bvid not in saved_ids]
-        if old and fresh and not self._selected_bvids:
-            slots = max(1, remaining // 2)
-            if remaining == 1:
-                turn_key = "queue_turn:" + uid
-                turn = (await asyncio.to_thread(self.store.control)).get(turn_key, "new")
-                chosen = old + fresh if turn == "saved" else fresh + old
-                await asyncio.to_thread(self.store.set_meta, turn_key, "new" if turn == "saved" else "saved")
-            else:
-                chosen = old[:slots] + fresh + old[slots:]
-        items = chosen
+            self._selected_bvids = []
+        else:
+            items, message = await self._plan_round_items(uid, cfg, stats, persona, mode, preview, remaining, eligible)
+            if items is None:
+                return message
+
         lines: List[str] = []
         commented_item = None
         up_counts: Dict[str, int] = {}
@@ -930,112 +1200,12 @@ class Autopilot:
                 bool(latest["unresolved"]) or bool(self.comment_cooldown(latest, cfg))
                 or latest["attempts"] >= cfg.comment.per_day
             )
-            prompt = decision_prompt(
-                item,
-                evidence,
-                persona=persona,
-                interests=cfg.browse.interests,
-                extra_style=cfg.model.extra_style,
-                max_chars=cfg.comment.max_chars,
-                candidate_only=candidate_only,
+            decision, evidence, error_line = await self._evaluate_video(
+                uid, item, evidence, cfg, persona, mode, preview, candidate_only
             )
-            try:
-
-                async def review_comment(d: Any) -> Any:
-                    nonlocal evidence
-                    if isinstance(self.client, BiliClient) and evidence.cid > 0 and "摘要" in evidence.source:
-                        evidence = await self.client.enrich(
-                            item, evidence, d.comment + " " + d.evidence_quote, cfg.model.content_max_chars
-                        )
-                        prompt[-1]["content"] = json.dumps(
-                            {
-                                "source": evidence.source,
-                                "video_content": evidence.text,
-                                "coverage": evidence.coverage,
-                                "segments": evidence.segments,
-                            },
-                            ensure_ascii=False,
-                        )
-                    if any(
-                        word.strip() and word.casefold() in evidence.text.casefold()
-                        for word in cfg.browse.blocked_keywords
-                    ):
-                        raise DecisionValidationError("blocked_content", "补充字幕命中屏蔽关键词")
-                    await self._check_support(
-                        d.comment,
-                        {
-                            "source": evidence.source,
-                            "text": evidence.text,
-                            "segments": evidence.segments,
-                            "coverage": evidence.coverage,
-                        },
-                        cfg,
-                    )
-                    # 再验证引用与补充内容一致；原摘要已被完整替换时，不能沿用不存在的引用。
-                    parse_decision(
-                        json.dumps(
-                            {
-                                "should_comment": d.should_comment,
-                                "interest": d.interest,
-                                "comment": d.comment,
-                                "reason": d.reason,
-                                "evidence_quote": d.evidence_quote,
-                            }
-                        ),
-                        evidence,
-                        cfg.comment.max_chars,
-                    )
-
-                decision = await self._model_decision(
-                    prompt,
-                    cfg,
-                    lambda raw: parse_decision(raw, evidence, cfg.comment.max_chars, candidate_only=candidate_only),
-                    preview,
-                    lambda d: not candidate_only and d.should_comment and d.interest >= cfg.comment.min_interest,
-                    review_comment,
-                )
-            except DecisionValidationError as exc:
-                reason = f"模型输出校验失败 [{exc.code}]：{exc}"
-                await self.record(
-                    uid,
-                    item,
-                    mode,
-                    "invalid_decision",
-                    json.dumps(
-                        {
-                            "reason": reason,
-                            "validation_error": exc.code,
-                            "source": evidence.source,
-                            "read_warning": evidence.read_warning,
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-                lines.append(f"{item.bvid} 跳过：{reason}；等待有限重查")
+            if decision is None:
+                lines.append(error_line)
                 continue
-            except (asyncio.TimeoutError, ModelTimeoutError) as exc:
-                reason = str(exc) if isinstance(exc, ModelTimeoutError) else "评论生成与依据复核总时限已到"
-                await self.record(uid, item, mode, "model_timeout", reason)
-                lines.append(f"{item.bvid} 模型判断超时：{reason}；本轮跳过，下轮继续，最多重查两次")
-                continue
-            except VideoReadError as exc:
-                await self.record(uid, item, mode, "read_error", f"补充字幕：{exc}", retryable=exc.retryable)
-                lines.append(f"{item.bvid} 跳过：补充字幕失败，未产生发送意图")
-                continue
-            except PlatformError as exc:
-                lines.append(await self._handle_video_read_rejection(uid, item, mode, exc))
-                continue
-            except ModelContentBlockedError as exc:
-                await self.record(uid, item, mode, "content_blocked", str(exc))
-                lines.append(f"{item.bvid} 跳过：{exc}")
-                continue
-            except ModelResponseError as exc:
-                await self.record(uid, item, mode, "model_error", str(exc))
-                lines.append(f"{item.bvid} 跳过：{exc}；后台保持运行，等待有限重查")
-                continue
-            except Exception as exc:
-                await self.record(uid, item, mode, "model_error", f"模型调用失败：{type(exc).__name__}")
-                raise
             detail = json.dumps(
                 {
                     "title": item.title,
@@ -1092,103 +1262,14 @@ class Autopilot:
                                         "quota_wait" if quota_full else "deferred")
                 lines.append(f"{item.bvid} 候选保留中：{fields['reason']}；尚未生成评论正文")
                 continue
-            # 所有长耗时操作结束后重新读取配置，暂停/关闭发布会在这里生效。
-            if not self.may_publish():
-                await self.record(uid, item, mode, "cancelled", "运行中已暂停、关闭发布或离开活动时段")
+            action, line = await self._publish_video_comment(uid, item, decision, detail, cfg, mode, day_start)
+            if line:
+                lines.append(line)
+            if action == "sent":
+                commented_item = item
+                break  # 一轮最多发布一条；平台接收不等同于最终公开展示。
+            if action == "stop":
                 break
-            current = self.get_config()
-            if current != cfg:
-                await self.record(uid, item, mode, "cancelled", "生成评论期间配置已变化，下轮重新判断")
-                break
-            if (
-                self.filter_item(item, current)
-                or len(decision.comment) > current.comment.max_chars
-                or decision.interest < current.comment.min_interest
-            ):
-                await self.record(uid, item, mode, "cancelled", "运行中筛选配置发生变化")
-                continue
-            now = self.clock()
-            reserved = await asyncio.to_thread(
-                self.store.reserve,
-                uid,
-                item.bvid,
-                decision.comment,
-                now,
-                local_day_start(now, current.browse.timezone),
-                current.comment.per_day,
-                current.comment.min_interval_seconds,
-                current.comment.similarity_threshold,
-            )
-            if reserved != "reserved":
-                fields = json.loads(detail)
-                fields.update(block_reason=reserved, decision_reason=fields["reason"], reason=reserved)
-                outcome = "blocked"
-                if reserved in {"cooldown", "daily_limit"}:
-                    outcome = "deferred" if reserved == "cooldown" else "quota_wait"
-                    fields["video"] = {
-                        "bvid": item.bvid,
-                        "aid": item.aid,
-                        "title": item.title,
-                        "up_uid": item.up_uid,
-                        "up_name": item.up_name,
-                        "duration": item.duration,
-                    }
-                    latest = await asyncio.to_thread(self.store.stats, uid, day_start)
-                    retry_at = max(
-                        next_local_day(now, current.browse.timezone)
-                        if latest["attempts"] >= current.comment.per_day
-                        else 0,
-                        latest["last_attempt"] + current.comment.min_interval_seconds,
-                    )
-                    fields["reason"] = (
-                        "daily_limit" if reserved == "daily_limit" else self.comment_cooldown(latest, current)
-                    )
-                    await asyncio.to_thread(
-                        self.store.wait_video,
-                        uid,
-                        item,
-                        now,
-                        json.dumps(fields, ensure_ascii=False),
-                        retry_at,
-                        current.browse.backlog_max_age_hours,
-                        current.browse.backlog_max_items,
-                        outcome,
-                    )
-                else:
-                    await self.record(uid, item, mode, outcome, json.dumps(fields, ensure_ascii=False))
-                lines.append(f"{item.bvid} 未发布：{fields['reason']}")
-                if reserved in {"cooldown", "daily_limit"}:
-                    cooling = True
-                    continue
-                break
-            if not self.may_publish():
-                await asyncio.to_thread(self.store.finish, uid, item.bvid, "cancelled")
-                await self.record(uid, item, mode, "cancelled", "发布前已暂停")
-                break
-            try:
-                rpid = await self.client.publish(
-                    item, decision.comment, lambda: self.may_publish() and self.get_config() == cfg
-                )
-            except asyncio.CancelledError:
-                # pending 已经持久化，重新加载时会转为 unknown 并阻止再次发送。
-                raise
-            except PlatformError:
-                await asyncio.to_thread(self.store.finish, uid, item.bvid, "rejected")
-                await self.record(uid, item, mode, "rejected", detail)
-                raise
-            except (LoginRequired, PublishNotSent):
-                await asyncio.to_thread(self.store.finish, uid, item.bvid, "cancelled")
-                await self.record(uid, item, mode, "cancelled", detail)
-                raise
-            except Exception:
-                await asyncio.to_thread(self.store.finish, uid, item.bvid, "unknown")
-                await self.record(uid, item, mode, "unknown", detail)
-                raise UnknownPublish(f"{item.bvid} 的评论结果待核对，不会自动重试") from None
-            await asyncio.to_thread(self.store.finish, uid, item.bvid, "sent", rpid)
-            await self.record(uid, item, mode, "sent", detail)
-            lines.append(f"{item.bvid} 已提交评论（rpid={rpid}）：{decision.comment}")
-            commented_item = item
-            break  # 一轮最多发布一条；平台接收不等同于最终公开展示。
         if commented_item is not None and self.share_video is not None:
             try:
                 share_result = await self.share_video(uid, commented_item)

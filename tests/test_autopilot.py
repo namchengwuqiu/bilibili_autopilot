@@ -725,6 +725,44 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("看过不评论", await self.engine.round())
         self.client.publish.assert_not_awaited()
 
+    async def test_enrich_preserves_video_metadata_on_retry_and_keeps_summary_quote(self):
+        self.client.mock_add_spec(BiliClient)
+        summary_text = "前半段介绍背景。" * 10 + "深海生物利用发光器官吸引猎物，不同颜色与闪烁频率也能传递信号。"
+        self.client.understand.return_value = (
+            ITEM,
+            Evidence("B站 AI 摘要（可能存在概括误差）", summary_text, cid=20),
+        )
+        enriched = Evidence(
+            "AI 摘要与相关字幕",
+            "摘要：" + summary_text + "\n字幕：深海生物利用发光器官吸引猎物，不同颜色与闪烁频率也能传递信号。",
+            segments=[{"source": "subtitle", "from": 10.0, "to": 20.0, "text": "深海生物利用发光器官吸引猎物"}],
+        )
+        self.client.enrich.return_value = enriched
+        self.engine.review.side_effect = [
+            json.dumps({"supported": False, "kind": "factual", "reason": "第一轮不通过"}),
+            json.dumps({"supported": True, "kind": "factual", "reason": "第二轮通过"}),
+        ]
+        self.generate.side_effect = [decision(), decision()]
+        await self.engine.start()
+        self.assertIn("已提交评论", await self.engine.round())
+        self.assertEqual(self.generate.await_count, 2)
+        retry_payload = json.loads(self.generate.await_args_list[1].args[0][1]["content"])
+        self.assertEqual(retry_payload["title"], ITEM.title)
+        self.assertEqual(retry_payload["up"], ITEM.up_name)
+        self.assertIn("description", retry_payload)
+        self.assertNotIn("segments", retry_payload)
+        self.assertIn("[00:10-00:20]", retry_payload["video_content"])
+
+    async def test_inactive_hours_delay_sleeps_until_active_window_capped_at_one_hour(self):
+        self.cfg.browse.active_start_hour = 9
+        self.cfg.browse.active_end_hour = 23
+        await self.engine.start()
+        zone = ZoneInfo("Asia/Shanghai")
+        self.now = datetime(2026, 10, 19, 23, 30, tzinfo=zone).timestamp()
+        self.assertEqual(await self.engine.next_check_delay(), 3600)
+        self.now = datetime(2026, 10, 20, 8, 45, tzinfo=zone).timestamp()
+        self.assertEqual(await self.engine.next_check_delay(), 900)
+
 
 class StoreTests(unittest.TestCase):
     def setUp(self):
@@ -852,6 +890,58 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(active_time(night, "Asia/Shanghai", 9, 23))
         start = local_day_start(night, "Asia/Shanghai")
         self.assertEqual(datetime.fromtimestamp(start, ZoneInfo("Asia/Shanghai")).hour, 0)
+
+    def test_decision_prompt_formats_segments_once_without_duplicating_text(self):
+        from local_bilibili_autopilot.models import decision_prompt, format_evidence_content
+        ev = Evidence(
+            "字幕（开头、中段和结尾的文本片段）",
+            "第一段字幕内容\n第二段字幕内容",
+            segments=[
+                {"source": "subtitle", "from": 5.0, "to": 12.0, "text": "第一段字幕内容"},
+                {"source": "subtitle", "from": 65.0, "to": 72.0, "text": "第二段字幕内容"},
+            ],
+        )
+        prompt = decision_prompt(ITEM, ev, persona="好奇", interests="科普", extra_style="", max_chars=160)
+        self.assertIn("[autopilot:comment_decision]", prompt[0]["content"])
+        payload = json.loads(prompt[1]["content"])
+        self.assertNotIn("segments", payload)
+        self.assertIn("[00:05-00:12] 第一段字幕内容", payload["video_content"])
+        self.assertIn("[01:05-01:12] 第二段字幕内容", payload["video_content"])
+        self.assertEqual(format_evidence_content(ev).count("第一段字幕内容"), 1)
+
+    def test_next_active_time_and_store_pruning_and_wal(self):
+        from local_bilibili_autopilot.models import next_active_time
+        zone = ZoneInfo("Asia/Shanghai")
+        night = datetime(2026, 10, 19, 23, 30, tzinfo=zone).timestamp()
+        expected_morning = datetime(2026, 10, 20, 9, 0, tzinfo=zone).timestamp()
+        self.assertEqual(next_active_time(night, "Asia/Shanghai", 9, 23), expected_morning)
+        self.assertEqual(next_active_time(NOW, "Asia/Shanghai", 9, 23), NOW)
+        with TemporaryDirectory() as folder:
+            store = StateStore(Path(folder) / "state.sqlite3")
+            store.initialize(NOW)
+            with store.connect() as db:
+                mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+                self.assertEqual(mode.lower(), "wal")
+                self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], 1)
+            with store.connect(durable=True) as db:
+                self.assertEqual(db.execute("PRAGMA synchronous").fetchone()[0], 2)
+            store.model_call("1", "browse_decision", NOW - 40 * 86400, 1.0, "success")
+            store.model_call("1", "browse_decision", NOW - 1 * 86400, 1.0, "success")
+            store.record_browse_decision("1", NOW - 40 * 86400, False, "旧决定", NOW - 39 * 86400)
+            store.record_browse_decision("2", NOW - 40 * 86400, False, "唯一旧决定", NOW - 39 * 86400)
+            store.record_browse_decision("1", NOW - 1 * 86400, True, "新决定", NOW)
+            store.prune_logs(NOW, retention_days=30)
+            self.assertEqual(len(store.page_records("1", "decisions", "", 1)["rows"]), 2)
+            store.prune_logs(NOW, decision_retention_days=30)
+            with store.connect() as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM model_calls").fetchone()[0], 1)
+                self.assertEqual(db.execute("SELECT count(*) FROM browse_decisions WHERE uid='1'").fetchone()[0], 1)
+                self.assertEqual(db.execute("SELECT count(*) FROM browse_decisions WHERE uid='2'").fetchone()[0], 1)
+            self.assertEqual(store.unseen_bvids("1", [ITEM.bvid, "BV0000000001"], "publish", now=NOW),
+                             {ITEM.bvid, "BV0000000001"})
+            store.visit("1", ITEM.bvid, "publish", NOW, "skipped", "{}")
+            self.assertEqual(store.unseen_bvids("1", [ITEM.bvid, "BV0000000001"], "publish", now=NOW),
+                             {"BV0000000001"})
 
 
 if __name__ == "__main__":

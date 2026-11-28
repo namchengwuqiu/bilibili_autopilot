@@ -59,6 +59,13 @@ class BrowseSection(PluginConfigBase):
 
     __ui_label__ = "浏览与兴趣"
     __ui_order__ = 1
+    decision_retention_days: int = Field(
+        default=0, ge=0, description="自主浏览决定历史的保留天数，0 表示永久保留",
+        json_schema_extra={
+            "label": "自主决定历史保留天数",
+            "hint": "默认 0，永久保留。设为正数后定期删除超过该天数的自主决定，每个账号至少保留最新一条。",
+        },
+    )
     backlog_max_items: int = Field(
         default=24, ge=1, le=100, description="评论候选池上限，超限按兴趣、新鲜度与等待时间择优保留",
         json_schema_extra={
@@ -347,13 +354,37 @@ class ModelSection(PluginConfigBase):
             "hint": "填写麦麦已配置的具体模型名，每项一个。单个模型超时后换下一个，每轮每个模型最多尝试一次；留空时由模型任务选择。",
         },
     )
+    fast_task: str = Field(
+        default="utils",
+        description="Host 中用于浏览意愿、候选选片和正文依据复核的快速模型任务；留空沿用主任务",
+        json_schema_extra={
+            "label": "快速判断使用的模型任务",
+            "hint": "默认 utils（工具任务），用于浏览意愿、候选选片和正文依据复核等轻量判断；留空时沿用评论使用的模型任务与候选模型。若快速任务失败会自动回退到主任务。",
+            "placeholder": "utils",
+        },
+    )
+    fast_candidates: List[str] = Field(
+        default_factory=list,
+        description="快速判断阶段按顺序尝试的具体模型名；留空时由快速模型任务选择",
+        json_schema_extra={
+            "label": "快速判断候选模型（按顺序尝试）",
+            "hint": "可选，填写麦麦已配置的轻量模型名，每项一个；留空时由上面的快速判断模型任务选择。",
+        },
+    )
 
-    @field_validator("candidates")
+    @field_validator("candidates", "fast_candidates")
     @classmethod
     def normalize_candidates(cls, values: List[str]) -> List[str]:
         if any(not value.strip() for value in values):
             raise ValueError("候选模型名不能为空")
         return list(dict.fromkeys(value.strip() for value in values))
+
+    def attempts(self, *, fast: bool = False) -> list[tuple[str, str]]:
+        tasks = []
+        if fast and self.fast_task.strip():
+            tasks.append((self.fast_task.strip(), self.fast_candidates))
+        tasks.append((self.task, self.candidates))
+        return list(dict.fromkeys((task, model) for task, candidates in tasks for model in candidates or [""]))
 
     timeout_seconds: int = Field(
         default=90,

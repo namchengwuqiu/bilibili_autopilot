@@ -4,7 +4,8 @@ from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 import asyncio
 import json
@@ -400,6 +401,119 @@ class HandoffContentTests(unittest.TestCase):
             parse_support('{"supported":true}')
 
 
+class HostModelRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        temp = TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.plugin = BilibiliAutopilotPlugin()
+        self.plugin.set_plugin_config({
+            "plugin": {"config_version": "0.3.0"},
+            "browse": {"auto_start": False, "active_start_hour": 0, "active_end_hour": 0},
+            "comment": {"publish_enabled": True}, "model": {"review_timeout_seconds": 1},
+        })
+        self.cfg = self.plugin.config
+        self.host = AsyncMock()
+        self.plugin._ctx = SimpleNamespace(
+            llm=SimpleNamespace(generate=self.host), paths=SimpleNamespace(data_dir=temp.name),
+            chat=AsyncMock(), send=AsyncMock(), logger=SimpleNamespace(info=lambda *a: None, warning=lambda *a: None),
+        )
+        self.plugin._schedule = asyncio.Event().wait
+        self.plugin._persona = AsyncMock(return_value="好奇")
+        client = AsyncMock()
+        client.uid = client.check_account.return_value = "1"
+        with patch("local_bilibili_autopilot.plugin.BiliClient", return_value=client):
+            await self.plugin.on_load()
+        self.addAsyncCleanup(self.plugin.on_unload)
+        self.engine = self.plugin.engine
+        await self.engine.start()
+
+    def tasks_called(self):
+        return [call.kwargs.get("task_name") or call.kwargs["model"] for call in self.host.await_args_list]
+
+    async def test_bad_browse_json_falls_back_and_primary_can_decline(self):
+        self.host.side_effect = [
+            {"success": True, "response": "想刷会儿"},
+            {"success": True, "response": json.dumps({"should_browse": False, "reason": "想休息",
+                                                     "next_check_minutes": 15, "selected_bvids": []})},
+        ]
+        self.assertFalse(await self.engine._want_to_browse(
+            "1", self.cfg, self.engine.store.stats("1", 0), "好奇", [ITEM],
+        ))
+        self.assertEqual(self.tasks_called(), ["utils", "replyer"])
+        self.assertEqual(self.engine.store.latest_browse_decision("1")["reason"], "想休息")
+        with self.engine.store.connect() as db:
+            self.assertEqual([r[0] for r in db.execute("SELECT outcome FROM model_calls ORDER BY id")],
+                             ["failed", "success"])
+
+    async def test_selection_checks_allowed_ids_and_accepts_fast_abstention(self):
+        pool = [{"item": ITEM, "bvid": ITEM.bvid, "fields": {}, "ts": NOW}]
+        self.host.side_effect = [
+            {"success": True, "response": json.dumps({"selected_bvid": "BV0000000000", "reason": "选片"})},
+            {"success": True, "response": json.dumps({"selected_bvid": ITEM.bvid, "reason": "喜欢这条"})},
+            {"success": True, "response": json.dumps({"selected_bvid": "", "reason": "先休息"})},
+        ]
+        items, _ = await self.engine._select_candidate_item("1", self.cfg, pool, "好奇")
+        self.assertEqual(items, [ITEM])
+        items, _ = await self.engine._select_candidate_item("1", self.cfg, pool, "好奇")
+        self.assertIsNone(items)
+        self.assertEqual(self.tasks_called(), ["utils", "replyer", "utils"])
+
+    async def test_hung_fast_review_leaves_time_for_primary(self):
+        async def generate(prompt, *, model, **kwargs):
+            if model == "utils":
+                await asyncio.Event().wait()
+            return {"success": True, "response": support()}
+
+        self.host.side_effect = generate
+        result = await self.engine._check_support("正文", {"text": "依据"}, self.cfg)
+        self.assertTrue(result["supported"])
+        self.assertEqual(self.tasks_called(), ["utils", "replyer"])
+        with self.engine.store.connect() as db:
+            self.assertEqual([r[0] for r in db.execute("SELECT outcome FROM model_calls ORDER BY id")],
+                             ["timeout", "success"])
+
+    async def test_review_retries_bad_schema_and_honors_a_valid_rejection(self):
+        malformed = json.dumps({"supported": True, "kind": [], "reason": "格式错误"})
+        self.host.side_effect = [{"success": True, "response": raw} for raw in (malformed, support(False), support(False))]
+        for _ in range(2):
+            with self.assertRaises(DecisionValidationError) as raised:
+                await self.engine._check_support("正文", {}, self.cfg)
+            self.assertEqual(raised.exception.code, "unsupported_body")
+        self.assertEqual(self.tasks_called(), ["utils", "replyer", "utils"])
+
+    async def test_blank_fast_task_ignores_saved_fast_candidates(self):
+        self.cfg.model.fast_task = " "
+        self.cfg.model.fast_candidates = ["old-fast"]
+        self.cfg.model.candidates = ["main-model"]
+        self.host.return_value = {"success": True, "response": support()}
+        await self.engine._check_support("正文", {}, self.cfg)
+        self.assertEqual(self.tasks_called(), ["replyer"])
+        self.assertEqual(self.host.await_args.kwargs["model_name"], "main-model")
+
+    async def test_polish_review_can_fall_back_within_shorter_share_budget(self):
+        self.cfg.share.polish_timeout_seconds = 1
+        self.cfg.model.review_timeout_seconds = 45
+        self.engine.store.reserve("1", ITEM.bvid, "这棵树成了景点", NOW, 0, 10, 300, 0.88)
+        self.engine.store.finish("1", ITEM.bvid, "sent", "500")
+        self.engine.store.visit("1", ITEM.bvid, "publish", NOW, "sent",
+                                json.dumps({"evidence_quote": "景区有一棵树作为景点"}))
+        draft, polished = "这树还成景点了", "一棵树也是景点啊"
+
+        async def generate(prompt, *, model, **kwargs):
+            system = prompt[0]["content"]
+            if "evidence_review" in system:
+                if json.loads(prompt[1]["content"])["original_draft"] and model == "utils":
+                    await asyncio.Event().wait()
+                raw = support()
+            else:
+                raw = json.dumps({"text": polished if "share_polish" in system else draft})
+            return {"success": True, "response": raw}
+
+        self.host.side_effect = generate
+        self.assertEqual(await self.plugin._compose_share("1", ITEM, self.cfg), polished)
+        self.assertEqual(self.tasks_called(), ["replyer", "utils", "replyer", "utils", "replyer"])
+
+
 class SharePolishTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.plugin = BilibiliAutopilotPlugin()
@@ -425,6 +539,56 @@ class SharePolishTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trace["polish_candidate"], self.polished)
         self.assertEqual(trace["result_mode"], "polished")
 
+    async def test_unchanged_polish_skips_redundant_second_review(self):
+        self.plugin._generate = AsyncMock(
+            side_effect=[json.dumps({"text": self.draft}), support(), json.dumps({"text": self.draft})]
+        )
+        trace = {}
+        result = await self.plugin._share_steps(ITEM, self.context, self.plugin.config.model_copy(deep=True), trace=trace)
+        self.assertEqual(result, self.draft)
+        self.assertEqual(self.plugin._generate.await_count, 3)
+        self.assertEqual(trace["result_mode"], "polished")
+        self.assertNotIn("polish_review", trace)
+
+    async def test_fast_task_routes_lightweight_stages_and_falls_back_to_primary(self):
+        from types import SimpleNamespace
+        with TemporaryDirectory() as folder:
+            store = StateStore(Path(folder) / "state.sqlite3")
+            store.initialize()
+            self.plugin.engine = SimpleNamespace(store=store)
+            self.plugin.client = SimpleNamespace(uid="1")
+            generate = AsyncMock(side_effect=[
+                {"success": True, "response": "fast-ok"},
+                {"success": False, "error": "utils unavailable"},
+                {"success": True, "response": "primary-ok"},
+                {"success": True, "response": "comment-ok"},
+            ])
+            self.plugin._ctx = SimpleNamespace(
+                llm=SimpleNamespace(generate=generate),
+                logger=SimpleNamespace(warning=lambda *a: None),
+            )
+            cfg = AutopilotConfig.model_validate({"model": {"candidates": ["primary-model"]}})
+            self.assertEqual(cfg.model.fast_task, "utils")
+            # 轻量阶段先走 utils 工具任务
+            res1 = await BilibiliAutopilotPlugin._generate(
+                self.plugin, [{"role": "system", "content": "[autopilot:browse_decision]"}], cfg
+            )
+            self.assertEqual(res1, "fast-ok")
+            self.assertEqual(generate.await_args_list[0].kwargs["model"], "utils")
+            # 快速任务失败后自动回退到主任务候选模型
+            res2 = await BilibiliAutopilotPlugin._generate(
+                self.plugin, [{"role": "system", "content": "[autopilot:evidence_review]"}], cfg
+            )
+            self.assertEqual(res2, "primary-ok")
+            self.assertEqual(generate.await_args_list[1].kwargs["model"], "utils")
+            self.assertEqual(generate.await_args_list[2].kwargs["model_name"], "primary-model")
+            # 评论正文创作阶段直接使用主任务
+            res3 = await BilibiliAutopilotPlugin._generate(
+                self.plugin, [{"role": "system", "content": "[autopilot:comment_decision]"}], cfg
+            )
+            self.assertEqual(res3, "comment-ok")
+            self.assertEqual(generate.await_args_list[3].kwargs["model_name"], "primary-model")
+
     async def test_unfounded_polish_is_reviewed_and_fallback_recorded(self):
         self.plugin._generate = AsyncMock(side_effect=[
             json.dumps({"text": self.draft}), support(), json.dumps({"text": "树边还有三间小店"}), support(False),
@@ -449,7 +613,7 @@ class SharePolishTests(unittest.IsolatedAsyncioTestCase):
                 {"success": True, "response": "valid", "usage": {"total_tokens": 23}},
             ])
             self.plugin._ctx = SimpleNamespace(llm=SimpleNamespace(generate=generate), logger=SimpleNamespace(warning=lambda *a: None))
-            cfg = AutopilotConfig.model_validate({"model": {"candidates": ["first", "second"]}})
+            cfg = AutopilotConfig.model_validate({"model": {"candidates": ["first", "second"], "fast_task": ""}})
             result = await BilibiliAutopilotPlugin._generate(self.plugin, [{"role": "system", "content": "[autopilot:evidence_review]"}], cfg)
             self.assertEqual(result, "valid")
             self.assertEqual(store.model_usage("1", 0)["calls"], 2)
@@ -601,19 +765,21 @@ class SharePolishTests(unittest.IsolatedAsyncioTestCase):
                 store.finish("1", ITEM.bvid, "sent", "500")
                 store.visit("1", ITEM.bvid, "publish", NOW, "sent", json.dumps({"evidence_quote": "一棵树成为景点"}))
 
-                async def generate(prompt, cfg):
+                async def host_generate(prompt, **kwargs):
                     system = prompt[0]["content"]
                     if "share_polish" in system:
                         if pause:
                             await engine.pause("人工暂停", kind="manual")
                         else:
                             plugin.config.browse.interests = "配置变化"
-                        return json.dumps({"text": "一棵树就成景点了"})
-                    if "evidence_review" in system:
-                        return support()
-                    return json.dumps({"text": "这树还成景点了"})
+                        raw = json.dumps({"text": "一棵树就成景点了"})
+                    elif "evidence_review" in system:
+                        raw = support()
+                    else:
+                        raw = json.dumps({"text": "这树还成景点了"})
+                    return {"success": True, "response": raw}
 
-                plugin._generate = AsyncMock(side_effect=generate)
+                plugin._ctx = SimpleNamespace(llm=SimpleNamespace(generate=host_generate))
                 chat = AsyncMock()
                 chat.get_group_streams.return_value = [
                     {

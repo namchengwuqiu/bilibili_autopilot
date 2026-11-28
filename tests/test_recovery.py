@@ -12,7 +12,7 @@ from bilibili_api.exceptions import NetworkException, ResponseCodeException
 
 import httpx
 
-from local_bilibili_autopilot.client import BiliClient, PlatformError, VideoReadError
+from local_bilibili_autopilot.client import BiliClient, PlatformError, SubtitleText, VideoReadError
 from local_bilibili_autopilot.config import AutopilotConfig
 from local_bilibili_autopilot.engine import Autopilot
 from local_bilibili_autopilot.models import (
@@ -21,6 +21,7 @@ from local_bilibili_autopilot.models import (
     ModelContentBlockedError,
     ModelResponseError,
     VideoItem,
+    decision_prompt,
     parse_decision,
 )
 from local_bilibili_autopilot.plugin import BilibiliAutopilotPlugin
@@ -149,6 +150,31 @@ class ReadingRecoveryTests(unittest.IsolatedAsyncioTestCase):
         _,evidence=await self.client.understand(ITEM,12000)
         self.assertEqual(evidence.read_warning,'')
         self.resource.get_subtitle.assert_not_awaited()
+
+    async def test_timestamped_subtitles_fit_budget_and_quotes_round_trip(self):
+        rows = [{"from": 3598 + i * 3, "to": 3600 + i * 3, "text": f"深海生物如何发光第{i}段"}
+                for i in range(400)]
+        self.sub.return_value = SubtitleText("\n".join(r["text"] for r in rows), rows)
+        self.resource.get_ai_conclusion.return_value = {}
+        _, subtitles = await self.client.understand(ITEM, 500)
+        self.resource.get_ai_conclusion.return_value = {"model_result": {"summary": EVIDENCE.text}}
+        _, summary = await self.client.understand(ITEM, 500)
+        enriched = await self.client.enrich(ITEM, summary, "如何发光", 500)
+        for evidence in (subtitles, enriched):
+            payload = decision_prompt(ITEM, evidence, persona="", interests="", extra_style="", max_chars=160)
+            content = json.loads(payload[1]["content"])["video_content"]
+            self.assertLessEqual(len(content), 500)
+            self.assertTrue(any(r["from"] == rows[-1]["from"] for r in evidence.segments))
+            lines = [line for line in content.splitlines() if line.startswith("[")]
+            for count in (1, 2):
+                quote = "\n".join(lines[:count])
+                result = parse_decision(json.dumps({**json.loads(VALID), "evidence_quote": quote}), evidence, 160)
+                self.assertEqual(result.evidence_quote, "\n".join(r["text"] for r in evidence.segments[:count]))
+            label = lines[0].split(" ", 1)[0]
+            for invalid in (label, label + " 深海", "[00:00-00:01] " + rows[0]["text"]):
+                with self.assertRaises(DecisionValidationError):
+                    parse_decision(json.dumps({**json.loads(VALID), "evidence_quote": invalid}), evidence, 160)
+        self.assertIn(summary.text, json.loads(payload[1]["content"])["video_content"])
 
     async def test_http_risk_or_login_error_does_not_read_subtitles(self):
         for code in (401,403,412,429):
