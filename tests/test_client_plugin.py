@@ -218,6 +218,12 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
 class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_unload_waits_for_in_flight_database_cleanup(self):
+        await self._check_unload_waits_for("clean_evidence")
+
+    async def test_unload_waits_for_in_flight_scheduler_status_query(self):
+        await self._check_unload_waits_for("recoveries")
+
+    async def _check_unload_waits_for(self, method):
         with TemporaryDirectory() as folder:
             plugin = BilibiliAutopilotPlugin()
             plugin.set_plugin_config({})
@@ -227,16 +233,19 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             )
             entered, release = asyncio.Event(), Event()
             loop = asyncio.get_running_loop()
-            original = StateStore.clean_evidence
+            original = getattr(StateStore, method)
 
-            def slow_cleanup(store, now):
-                loop.call_soon_threadsafe(entered.set)
-                if not release.wait(timeout=5):
-                    raise TimeoutError("测试清理任务未释放")
-                original(store, now)
+            def slow_operation(store, *args):
+                with store.connect():
+                    loop.call_soon_threadsafe(entered.set)
+                    if not release.wait(timeout=5):
+                        raise TimeoutError("测试数据库操作未释放")
+                return original(store, *args)
 
-            with patch.object(StateStore, "clean_evidence", slow_cleanup), \
-                    patch("local_bilibili_autopilot.plugin.BiliClient", return_value=AsyncMock()):
+            client = AsyncMock()
+            client.uid = ""
+            with patch.object(StateStore, method, slow_operation), \
+                    patch("local_bilibili_autopilot.plugin.BiliClient", return_value=client):
                 await plugin.on_load()
                 await asyncio.wait_for(entered.wait(), timeout=2)
                 unload = asyncio.create_task(plugin.on_unload())

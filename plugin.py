@@ -1,7 +1,7 @@
 """麦麦 SDK v2 入口。定时任务和手动预览共用串行引擎。"""
 
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, TypeVar
 
 import asyncio
 import base64
@@ -49,6 +49,19 @@ HELP = (
     "/bili_auto logout：暂停并清除本插件登录态\n"
     "/bili_auto ack BV号：自行核对未知发送结果后解除阻塞，该视频仍不会重发"
 )
+
+
+_Result = TypeVar("_Result")
+
+
+async def _finish_store_operation(operation: Awaitable[_Result]) -> _Result:
+    # 取消调度协程不会停止 SQLite 工作线程，卸载前应等当前数据库操作关闭连接。
+    worker = asyncio.ensure_future(operation)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        await worker
+        raise
 
 
 class BilibiliAutopilotPlugin(MaiBotPlugin):
@@ -503,13 +516,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
             if prune:
                 engine.store.prune_logs(now, decision_retention_days=keep_days)
 
-        # 取消协程不会停止 SQLite 工作线程。卸载要等它关闭连接，再交还数据目录。
-        worker = asyncio.create_task(asyncio.to_thread(clean))
-        try:
-            await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            await worker
-            raise
+        await _finish_store_operation(asyncio.to_thread(clean))
         if prune:
             self._last_prune = mono
 
@@ -543,7 +550,7 @@ class BilibiliAutopilotPlugin(MaiBotPlugin):
                     del result
                 try:
                     delay = (
-                        await self.engine.next_check_delay()
+                        await _finish_store_operation(self.engine.next_check_delay())
                         if self.engine is not None
                         else self.config.browse.interval_seconds
                     )
